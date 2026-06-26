@@ -1,0 +1,62 @@
+name: Deploy landing page
+
+# The repo's web/ app is a full Next.js app (dashboard + docs + API routes) that
+# needs the backend. GitHub Pages only serves static files, so this builds a
+# landing-only static export: it strips the dashboard/docs/api routes, then
+# `next build` with PAGES_EXPORT=1 (output: export, basePath /mergequeue).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - web/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Strip the backend-coupled routes (keep landing + docs)
+        run: rm -rf app/app app/api
+      - name: Build static landing + docs
+        run: pnpm build
+        env:
+          PAGES_EXPORT: "1"
+          NEXT_PUBLIC_STATIC_LANDING: "1"
+          NEXT_PUBLIC_SITE_URL: https://lumaprism.github.io/mergequeue
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

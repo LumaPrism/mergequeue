@@ -1,0 +1,14 @@
+{
+  "title": "mergequeue docs",
+  "pages": [
+    "---Getting Started---",
+    "index",
+    "getting-started",
+    "---Concepts---",
+    "how-it-works",
+    "configuration",
+    "---Guides---",
+    "ci-integration",
+    "self-hosting"
+  ]
+}

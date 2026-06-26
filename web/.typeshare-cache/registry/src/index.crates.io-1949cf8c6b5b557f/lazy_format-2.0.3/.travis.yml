@@ -1,0 +1,18 @@
+language: rust
+
+rust:
+  - stable
+  - beta
+  - nightly
+
+before_script:
+  - rustup component add clippy
+
+script:
+  - cargo clippy --verbose --all-features
+  - cargo test --verbose --all-features
+
+matrix:
+  allow_failures:
+    - rust: nightly
+  fast_finish: true

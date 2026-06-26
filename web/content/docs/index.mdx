@@ -1,0 +1,74 @@
+---
+title: Introduction
+description: mergequeue is a self-hostable, CI-agnostic merge queue that batches ready PRs, tests the combined result against the latest base, and lands them together — or bisects to eject the one that broke.
+---
+
+## What is mergequeue?
+
+mergequeue keeps your default branch green without anyone babysitting it. When a
+pull request is approved and passing, it joins the queue. mergequeue takes the
+next batch of ready PRs, stages them together on top of the very latest base on a
+throwaway branch, and runs your repository's required CI checks against that
+**combined** result — the exact code that is about to land. If the batch is
+green, base fast-forwards to it in a single move. If it is red, mergequeue
+bisects the batch to find the offending PR, ejects it with an explanatory
+comment, and re-queues the rest.
+
+<Callout type="idea" title="The train">
+  The dashboard renders the queue as a **train**: queued PRs ride as **cars** and
+  **land** into your base branch in merge order. We use that metaphor throughout —
+  batch, test, land, or eject.
+</Callout>
+
+It is a small Rust service (Poem + SeaORM) backed by Postgres, plus this Next.js
+dashboard. You install it as a GitHub App against your own org, and it talks to
+GitHub over the API. Nothing about your source or your keys leaves your
+infrastructure.
+
+## Why a merge queue at all?
+
+The classic failure mode of a busy repo is the **semantic merge conflict**: two
+PRs each pass CI on their own branch, both merge, and `main` breaks because their
+combined state was never tested. A merge queue closes that gap by testing PRs
+**in the order and combination they will actually land**, against the current tip
+of base — not against the stale commit they were branched from.
+
+mergequeue adds three things on top of the basic idea:
+
+- **Optimistic batching** — multiple ready PRs are staged and tested together, so
+  one CI run can land several PRs. Throughput scales with batch size while base
+  stays always-green.
+- **Bisect to eject** — when a batch fails, mergequeue doesn't blindly reject
+  everything. It splits the batch to isolate the breaking PR, ejects only that
+  one, and re-queues the innocents.
+- **A crash-safe FSM** — every batch is an explicit, persisted state machine.
+  State is written *before* each GitHub side effect, so a process restart resumes
+  mid-flight instead of corrupting the queue.
+
+## vs. GitHub's native merge queue
+
+GitHub ships a native merge queue, but it has real constraints:
+
+- **It isn't available on every plan** for private repositories, so many teams
+  can't use the native queue where they need it.
+- **It is coupled to GitHub Actions–style status reporting** and the GitHub UI.
+  mergequeue instead reads whatever **required status checks / check-runs** your
+  branch protection already defines, so it works with any CI system.
+- **It is a black box.** mergequeue's batch lifecycle is an explicit state
+  machine you can inspect in the dashboard and reason about.
+
+mergequeue runs anywhere you can run a container and a Postgres database, against
+public or private repos, on any GitHub plan.
+
+## Where to go next
+
+- [Getting Started](/docs/getting-started) — install the GitHub App and point it
+  at a repository.
+- [How it works](/docs/how-it-works) — the batch lifecycle, bisect-to-eject, and
+  crash safety in detail.
+- [Configuration](/docs/configuration) — base branch, batch size, required
+  checks, merge method, staging prefix.
+- [CI integration](/docs/ci-integration) — wiring up Woodpecker, GitHub Actions,
+  or any other CI.
+- [Self-hosting](/docs/self-hosting) — the docker-compose deployment and `MQ_*`
+  configuration.

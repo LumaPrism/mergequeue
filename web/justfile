@@ -1,0 +1,43 @@
+# Regenerate the shared TypeScript types from the Rust backend via typeshare.
+# Runs typeshare-cli in an ephemeral Docker container (compiled once into a local
+# cache) so nothing is installed globally. Output is committed: lib/api-types.ts.
+regen-types:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    backend="$PWD/../backend"
+    [ -d "$backend/src" ] || { echo "expected the backend crate at ../backend" >&2; exit 1; }
+    out="$PWD/lib/api-types.ts"
+    cache="$PWD/.typeshare-cache"
+    mkdir -p "$cache"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    docker run --rm \
+        --user "$(id -u):$(id -g)" \
+        -e CARGO_HOME=/cache \
+        -v "$cache:/cache" \
+        -v "$backend:/src:ro" \
+        -v "$tmp:/out" \
+        rust:1-slim-bookworm \
+        bash -c '
+            set -euo pipefail
+            if [ ! -x /cache/bin/typeshare ]; then
+                echo "→ compiling typeshare-cli (first run only)…" >&2
+                cargo install typeshare-cli --root /cache >&2
+            fi
+            exec /cache/bin/typeshare /src --lang=typescript --output-file=/out/api.ts
+        '
+
+    {
+        echo "/*"
+        echo " * GENERATED — do not edit by hand."
+        echo " * Produced by 'just regen-types': typeshare over the mergequeue backend"
+        echo " * crate. Re-run after any backend type change."
+        echo " */"
+        echo ""
+        echo "// Rust newtypes typeshare can't emit:"
+        echo "export type Uuid = string;"
+        echo ""
+        cat "$tmp/api.ts"
+    } > "$out"
+    echo "✓ regenerated $out"

@@ -1,0 +1,119 @@
+---
+title: CI integration
+description: mergequeue works with any CI — it reads the required check-runs and commit statuses on the staging branch. Examples for Woodpecker and GitHub Actions.
+---
+
+## The core idea: mergequeue reads checks, it doesn't run them
+
+mergequeue is **CI-agnostic**. It never invokes your test runner. Instead, when it
+creates the staging branch `mq/staging/<base>`, it relies on your CI to do what it
+already does on every branch: run, and report results back to GitHub as
+**check-runs** or **commit statuses**. mergequeue watches those results on the
+staging branch and uses your repository's **required checks** to decide green or
+red.
+
+This means anything that reports check-runs or commit statuses to GitHub works
+out of the box — GitHub Actions, Woodpecker, Buildkite, CircleCI, Jenkins, Drone,
+Concourse, and so on. There is no plugin to install in your CI.
+
+## What your CI must do
+
+1. **Trigger on the staging branch.** Make sure your pipeline runs on pushes to
+   branches matching `mq/staging/*` (or whatever [staging prefix](/docs/configuration)
+   you configured). If your CI only builds PR branches, it will never test the
+   batch.
+2. **Report a status GitHub recognizes as a required check.** The check name must
+   match one of the repo's required checks so mergequeue counts it.
+
+That's the CI half of the contract — see [Letting mergequeue land the
+merge](#letting-mergequeue-land-the-merge) below for the other half.
+
+> **Already set up for GitHub's native merge queue?** Then your CI almost
+> certainly triggers on `gh-readonly-queue/**` (Woodpecker) or the `merge_group`
+> event (GitHub Actions). Those fire for *GitHub's* queue — **not** mergequeue's
+> `mq/staging/**` branch. Add `mq/staging/**` to your push triggers (as shown
+> below); otherwise the staging commit gets zero checks and PRs hang in
+> `testing` forever.
+
+## Example: Woodpecker CI
+
+Woodpecker reports a commit status per pipeline. Make sure the staging branch is
+not excluded by your `when` filters:
+
+```yaml
+# .woodpecker.yaml
+when:
+  - event: push
+    branch:
+      - main
+      - mq/staging/*
+
+steps:
+  test:
+    image: rust:1
+    commands:
+      - cargo test --all
+```
+
+Add the resulting status (for example `ci/woodpecker/push/test`) to your branch's
+required checks, and mergequeue will gate batches on it.
+
+## Example: GitHub Actions
+
+GitHub Actions reports check-runs automatically. Include the staging branch in the
+workflow's `push` trigger:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "mq/staging/**"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --all
+```
+
+The `test` job appears as a check-run on the staging branch. Mark it required in
+branch protection and mergequeue will wait for it.
+
+## Letting mergequeue land the merge
+
+Green checks on the staging branch are necessary but **not sufficient**. To land a
+batch, mergequeue **fast-forwards your base branch** to the tested staging tip — a
+direct ref update made by the App. If your base branch is protected by a
+**ruleset** (or classic protection) that *requires a pull request* or *requires
+status checks*, GitHub rejects that update unless the App is allowed to bypass it.
+
+Add the mergequeue App as a **bypass actor**:
+
+1. GitHub → repo (or org) **Settings → Rules → Rulesets** → open the ruleset that
+   protects your base branch.
+2. Under **Bypass list**, add the **mergequeue GitHub App** → **Allow**.
+
+(For classic branch protection, add the App to the branch's allowed-to-push list.)
+
+This is the same kind of privileged mechanism GitHub's own merge queue relies on:
+something has to be trusted to move the protected branch once the combined batch
+is green.
+
+If the App can't land a batch, mergequeue does **not** retry silently — it
+comments on each PR and adds a **`merge-queue: blocked`** label explaining this
+exact fix. It keeps the batch in `merging`, so the moment you grant the bypass the
+next check lands it with no re-queue.
+
+## Why this design
+
+Because mergequeue keys off the *required checks you already enforce on PRs*, the
+queue's definition of "green" is identical to the one your team trusts. There is
+no separate, divergent "merge-queue config" of what counts — you maintain one
+source of truth in branch protection, and mergequeue honors it on the combined
+batch. Switch CI providers tomorrow and mergequeue keeps working, as long as the
+new provider reports required checks on the staging branch.

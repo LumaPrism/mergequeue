@@ -1,0 +1,9 @@
+.git
+/web
+/docs
+**/target
+**/.typeshare-cache
+**/node_modules
+*.pem
+.env
+.env.*

@@ -1,0 +1,44 @@
+[package]
+name = "mergequeue"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mergequeue"
+path = "src/main.rs"
+
+[dependencies]
+# web / api
+poem = "3"
+poem-openapi = { version = "5", features = ["swagger-ui", "cookie"] }
+# db
+sea-orm.workspace = true
+migration = { path = "migration" }
+# async / runtime
+tokio.workspace = true
+apalis = { version = "0.6", features = ["limit"] }
+apalis-sql = { version = "0.6", features = ["postgres"] }
+# github
+octocrab = "0.41"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# webhook signature
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+subtle = "2"
+# config / secrets
+config = { version = "0.14", features = ["yaml"] }
+secrecy = { version = "0.10", features = ["serde"] }
+# serde / errors / misc
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
+chrono.workspace = true
+typeshare.workspace = true
+async-trait = "0.1"
+anyhow = "1"

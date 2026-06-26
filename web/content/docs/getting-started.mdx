@@ -1,0 +1,70 @@
+---
+title: Getting Started
+description: Install the mergequeue GitHub App via the manifest flow, point it at a repository, and queue your first pull request.
+---
+
+## Prerequisites
+
+- A running mergequeue instance (see [Self-hosting](/docs/self-hosting) for the
+  docker-compose setup). For a first run, the service only needs to be reachable
+  by GitHub for webhooks — use [smee.io](https://smee.io) to tunnel webhooks to
+  your laptop if you don't have a public URL yet.
+- A GitHub organization (or user account) where you can install a GitHub App.
+- A repository with **branch protection** enabled and at least one **required
+  status check** defined. mergequeue uses those required checks to decide whether
+  a batch is green.
+
+## 1. Create the GitHub App via the manifest flow
+
+mergequeue uses GitHub's **App manifest flow** so you don't have to fill in a
+form of permissions by hand. Open the setup endpoint on your instance:
+
+```
+https://your-mergequeue.example.com/setup
+```
+
+This page submits a pre-filled manifest to GitHub. GitHub shows you the exact
+permissions being requested, you confirm, and GitHub redirects back to
+mergequeue with a temporary code. mergequeue exchanges that code for the App's
+private key, App ID, and webhook secret, and persists them. You never copy a
+private key by hand.
+
+The manifest requests only what the queue needs:
+
+- **Contents** (read/write) — to create the staging branch and fast-forward base.
+- **Pull requests** (read/write) — to read the queue and comment on ejected PRs.
+- **Checks / Commit statuses** (read) — to read the required check results on the
+  staging branch.
+- **Webhooks** for `pull_request`, `check_run`, `status`, and `push` events.
+
+## 2. Install the App on your org
+
+After the App is created, GitHub offers to install it. Choose the organization
+and either **all repositories** or a specific selection. mergequeue only acts on
+repositories you explicitly enable in the dashboard, so installing broadly is
+safe.
+
+## 3. Point mergequeue at a repository
+
+Open the dashboard, pick the installation, and select the repository you
+want to manage. mergequeue reads the repo's branch-protection configuration to
+discover the **base branch** and its **required checks**. Confirm the defaults
+(or override them — see [Configuration](/docs/configuration)) and enable the
+repo.
+
+## 4. Queue a pull request
+
+With the repo enabled, queueing is automatic: when a PR is approved and its own
+checks are green, it becomes **eligible** and joins the queue. You can also add a
+PR to the queue from the dashboard.
+
+From here mergequeue takes over:
+
+1. It stages the next batch onto the latest base on a branch named
+   `mq/staging/<base>`.
+2. Your CI runs against that staging branch.
+3. Green → base fast-forwards and the PRs are merged. Red → mergequeue bisects to
+   the breaker, ejects it with a comment, and re-queues the rest.
+
+Watch the whole thing live in the dashboard. To understand each transition, read
+[How it works](/docs/how-it-works).

@@ -1,0 +1,70 @@
+---
+title: Configuration
+description: Configure mergequeue per repository — base branch, batch size, required checks, merge method, and the staging branch prefix.
+---
+
+## Where configuration lives
+
+Per-repository settings are managed in the dashboard and stored in
+Postgres alongside the queue state. Most settings are **discovered automatically**
+from your GitHub branch-protection configuration; you only override them when you
+want behavior different from the repo defaults. Instance-wide settings (database,
+GitHub App credentials, listen address) are `MQ_*` environment variables covered
+in [Self-hosting](/docs/self-hosting).
+
+## Base branch
+
+The branch the queue lands onto — usually `main`. mergequeue reads it from branch
+protection, but you can pin it explicitly per repo. Every batch is staged on top
+of the **current tip** of this branch and fast-forwarded onto it when green.
+
+## Batch size
+
+The maximum number of ready PRs mergequeue stages together in one batch.
+
+- **Larger batches** amortize CI over more PRs and raise throughput when the queue
+  is busy and changes rarely conflict.
+- **Smaller batches** shorten the bisect search on failure and reduce wasted CI
+  when conflicts are common.
+
+A batch size of `1` degrades gracefully to strictly serial, one-PR-at-a-time
+landing (no bisecting needed). Tune upward as you trust your suite.
+
+## Required checks
+
+The set of check-runs / commit statuses that must be green on the staging branch
+for a batch to land. By default mergequeue uses **exactly the required checks from
+your branch protection**, so the queue's definition of "green" matches the one
+you already enforce on PRs. You can narrow or extend this set per repo if your
+staging checks differ from your PR checks.
+
+mergequeue waits for **every** configured required check to conclude before
+deciding. Optional or informational checks are ignored.
+
+## Merge method
+
+How the batch is integrated into base when green. Because mergequeue fast-forwards
+the staging branch onto base, the staging branch is built to reflect your chosen
+method:
+
+- **Merge** — preserve each PR's commits with merge commits.
+- **Squash** — collapse each PR into a single commit.
+- **Rebase** — replay each PR's commits linearly onto base.
+
+Pick the method that matches your repository's history conventions.
+
+## Staging branch prefix
+
+The namespace for throwaway staging branches. The default is `mq/staging/`, so a
+batch targeting `main` lives on `mq/staging/main`. Change the prefix if it
+collides with an existing branch convention or if you want to exclude it from
+other automation with a glob. Staging branches are created and deleted by
+mergequeue and should not be edited by hand.
+
+## A note on branch protection
+
+For mergequeue to land batches, the GitHub App must be allowed to update the base
+branch. If you enforce "require status checks before merging" or restrict who can
+push to base, add the mergequeue App to the allowed actors, or let it merge
+through its required-check gate. mergequeue never bypasses your checks — it
+**runs** them on the combined result and only lands on green.

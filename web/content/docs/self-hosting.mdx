@@ -1,0 +1,103 @@
+---
+title: Self-hosting
+description: Run mergequeue yourself with docker-compose — Postgres plus the service, configured with MQ_* environment variables, and smee.io for local webhooks.
+---
+
+## What you're deploying
+
+mergequeue is one small Rust service plus a Postgres database. Your GitHub App
+private key, webhook secret, and source never leave your infrastructure — that's
+the point of self-hosting. The service exposes:
+
+- an HTTP API and the dashboard,
+- a `/setup` endpoint for the [GitHub App manifest flow](/docs/getting-started),
+- a webhook receiver for GitHub events.
+
+## docker-compose
+
+A minimal deployment is the service and Postgres:
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mergequeue
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: mergequeue
+    volumes:
+      - mq-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mergequeue"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mergequeue:
+    image: ghcr.io/your-org/mergequeue:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      MQ_DATABASE_URL: postgres://mergequeue:change-me@db:5432/mergequeue
+      MQ_LISTEN_ADDR: 0.0.0.0:8080
+      MQ_PUBLIC_URL: https://mergequeue.example.com
+      MQ_WEBHOOK_SECRET: ${MQ_WEBHOOK_SECRET}
+
+volumes:
+  mq-db:
+```
+
+Bring it up:
+
+```bash
+docker compose up -d
+```
+
+The service runs its database migrations on startup, so the schema is created
+automatically against a fresh Postgres.
+
+## MQ_* configuration
+
+| Variable             | Purpose                                                              |
+| -------------------- | ------------------------------------------------------------------- |
+| `MQ_DATABASE_URL`    | Postgres connection string.                                         |
+| `MQ_LISTEN_ADDR`     | Address/port the service binds (e.g. `0.0.0.0:8080`).               |
+| `MQ_PUBLIC_URL`      | The externally reachable base URL; used in the App manifest and callbacks. |
+| `MQ_WEBHOOK_SECRET`  | Shared secret GitHub signs webhook deliveries with.                |
+
+The GitHub **App ID and private key** are not set by hand — they are captured
+during the `/setup` manifest flow and persisted to the database, so the first run
+needs only the variables above. Keys never live in your shell history or a config
+file you might commit.
+
+## Local development with smee.io
+
+GitHub must reach your instance to deliver webhooks, which is awkward when
+mergequeue is running on your laptop. Use [smee.io](https://smee.io) to forward
+deliveries to localhost:
+
+1. Go to [smee.io](https://smee.io) and click **Start a new channel**. Copy the
+   channel URL (e.g. `https://smee.io/aBcDeF123`).
+2. Set that URL as your App's webhook URL (the manifest flow lets you supply it,
+   or edit the App settings afterward).
+3. Run the forwarder, pointing it at your local webhook path:
+
+   ```bash
+   npx smee-client --url https://smee.io/aBcDeF123 --target http://localhost:8080/webhook
+   ```
+
+Now `pull_request`, `check_run`, `status`, and `push` events flow from GitHub
+through smee to your local mergequeue, and you can develop the full queue loop
+without deploying anything public.
+
+## Behind a reverse proxy
+
+In production, terminate TLS at a reverse proxy (nginx, Caddy, Traefik) and
+forward to `MQ_LISTEN_ADDR`. Set `MQ_PUBLIC_URL` to the public HTTPS URL so the
+manifest flow and webhook callbacks resolve correctly. The dashboard's
+same-origin `/api` calls and the `/webhook` receiver are all served by the one
+service, so a single upstream is enough.

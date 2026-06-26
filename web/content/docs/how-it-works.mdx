@@ -1,0 +1,97 @@
+---
+title: How it works
+description: The mergequeue batch lifecycle — Staging, Testing, Merging, Merged, Bisecting, Ejected, and Superseded — plus bisect-to-eject and crash safety.
+---
+
+## The batch is the unit of work
+
+mergequeue doesn't reason about individual PRs landing one at a time. It reasons
+about **batches**. A batch is an ordered set of ready PRs that mergequeue stages
+together and tests as one combined commit. Each batch is an explicit, persisted
+**finite state machine (FSM)**, and the dashboard renders that machine live.
+
+## The states
+
+### Staging
+
+mergequeue takes the next batch of eligible PRs and rebuilds them on top of the
+**current tip of base** on a throwaway branch, `mq/staging/<base>` (for example
+`mq/staging/main`). Staging always starts from the latest base, so the batch is
+tested against the code it will actually merge into — not the stale commit each
+PR was branched from. When the staging branch is built and pushed, the batch
+transitions to **Testing**.
+
+### Testing
+
+Your CI runs against the staging branch. mergequeue does not run tests itself —
+it watches the **required check-runs and commit statuses** that your branch
+protection defines, exactly as GitHub reports them on `mq/staging/<base>`. When
+all required checks conclude:
+
+- **All green →** the batch moves to **Merging**.
+- **Any required check fails →** the batch moves to **Bisecting** (or straight to
+  **Ejected** if the batch holds a single PR).
+
+### Merging → Merged
+
+On green, mergequeue **fast-forwards base** to the staging commit in a single
+update. Because the staging branch *is* base plus the batch, this is a true
+fast-forward — no merge commit, no re-test, no race. The constituent PRs are
+marked merged and closed by GitHub, and the batch becomes **Merged**. The staging
+branch is deleted.
+
+### Bisecting → Ejected
+
+A red batch with more than one PR doesn't fail everyone. mergequeue **bisects**:
+it splits the batch and re-stages the halves to find the smallest set that still
+fails, isolating the single PR responsible for the break. That PR is **ejected** —
+removed from the queue, commented on with a link to the failing checks so the
+author knows exactly why — and the batch enters **Ejected**. The innocent PRs are
+re-queued and picked up in the next batch, so one bad change never wedges the
+queue.
+
+### Superseded
+
+If the world changes underneath an in-flight batch — base advances from an
+outside push, a PR in the batch is closed or updated, or required checks change —
+the batch is marked **Superseded**. mergequeue discards the stale staging branch
+and rebuilds a fresh batch from current reality. Any state can transition to
+**Superseded**; it's the escape hatch that keeps the queue honest.
+
+## The transition map
+
+```
+Staging  ──▶ Testing ──▶ Merging ──▶ Merged
+                │
+                └──▶ Bisecting ──▶ Ejected   (re-queue the innocents)
+
+  *  ──▶ Superseded   (base moved / inputs changed; rebuild)
+```
+
+## Bisect to eject, in detail
+
+Naive merge queues reject the whole batch on a single red check, which punishes
+good PRs and stalls throughput. mergequeue treats a failure as a **search
+problem**: somewhere in this ordered batch is a PR (or an interaction) that breaks
+the combined build. By re-staging subsets, it narrows down to the culprit and
+ejects only that PR. The cost is extra CI runs on failure, which is exactly when
+you want the extra information — and it's bounded, logarithmic in batch size, not
+linear.
+
+## Crash safety
+
+mergequeue is built to survive process death at any instant. The rule is simple:
+**persist intended state before performing the GitHub side effect, not after.**
+Before it pushes a staging branch, fast-forwards base, or ejects a PR, the FSM
+transition is committed to Postgres. On restart, mergequeue reads the persisted
+state and resumes:
+
+- A batch recorded as "about to fast-forward" re-checks base and completes the
+  fast-forward (idempotent — if it already happened, it's a no-op).
+- A staging branch left behind by a crash is reconciled against the recorded
+  batch and either reused or rebuilt.
+- No transition depends on in-memory state that a restart would lose.
+
+The result is a queue that is safe to redeploy, restart, or kill at any moment.
+There is no "stuck because the process died mid-merge" failure mode — every step
+is explicit, persisted, and idempotent.

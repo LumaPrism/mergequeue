@@ -1,0 +1,19 @@
+/backend/target
+**/target
+/.env
+.env.local
+*.pem
+/web/node_modules
+/web/.next
+/web/out
+/web/.source
+.source
+node_modules
+.DS_Store
+*.log
+*.tsbuildinfo
+
+web/UX_REDESIGN.md
+
+# internal agent context — not for the public repo
+CLAUDE.md

@@ -1,0 +1,15 @@
+# Per-project tools (isolated — `mise install`). No global installs.
+[tools]
+node = "22"
+just = "latest"
+"npm:smee-client" = "latest"
+
+# Non-secret dev defaults. Per-developer secrets (your smee channel) go in
+# .env (gitignored; loaded here via _.file).
+[env]
+_.file = ".env"
+MQ_SERVER__BASE_URL = "http://localhost:8080"
+MQ_SERVER__APP_URL = "http://localhost:3001"
+MQ_DATABASE__URL = "postgres://postgres:postgres@localhost:5433/mergequeue"
+MQ_PG_PORT = "5433"
+RUST_LOG = "info,mergequeue=debug"

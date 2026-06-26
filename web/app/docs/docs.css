@@ -1,0 +1,127 @@
+@import "tailwindcss";
+@import "fumadocs-ui/css/shadcn.css";
+@import "fumadocs-ui/css/preset.css";
+
+/* Fumadocs keys its dark theme on a `.dark` class (we force it via RootProvider),
+   but Tailwind v4's `dark:` variant defaults to prefers-color-scheme — so without
+   this the dark tokens never apply and /docs renders light on the brand-dark body. */
+@custom-variant dark (&:is(.dark *));
+
+/* globals.css (root layout) paints `body` with the brand background + a fixed
+   vignette overlay; both bleed onto /docs and fight Fumadocs. This file only loads
+   on /docs, so neutralize them and let the Fumadocs surface read on-brand. */
+body {
+  background: var(--color-fd-background);
+  letter-spacing: normal;
+}
+body::before {
+  display: none !important;
+}
+
+/* SIGNAL BOX — one palette across app, docs, and OG. Map Fumadocs's shadcn base
+   tokens onto the brand semantic tokens from globals.css (no hex fork, no parallel
+   gray scale). Brand amber is reused through `--primary`; `--accent` is the shadcn
+   *surface* token (hover/selected), kept distinct from the brand lamp. */
+.dark {
+  --background: var(--bg);
+  --foreground: var(--text);
+  --card: var(--bg-raise);
+  --card-foreground: var(--text);
+  --popover: var(--bg-raise);
+  --popover-foreground: var(--text);
+  --muted: var(--ink-800);
+  --muted-foreground: var(--text-meta);
+  --secondary: var(--ink-800);
+  --secondary-foreground: var(--text);
+  --accent: var(--ink-700);
+  --accent-foreground: var(--text);
+  --border: var(--line-2);
+  --input: var(--line-2);
+  --primary: var(--amber-500);
+  --primary-foreground: var(--amber-ink);
+  --ring: var(--amber-500);
+
+  --sidebar: var(--bg);
+  --sidebar-foreground: var(--text);
+  --sidebar-border: var(--line);
+  --sidebar-ring: var(--amber-500);
+  --sidebar-primary-foreground: var(--amber-ink);
+  --sidebar-accent: var(--ink-700);
+  --sidebar-accent-foreground: var(--text);
+
+  /* callouts speak signal aspects: amber = approach, blue = testing,
+     green = clear, red = danger — same color language as the FSM. */
+  --color-fd-info: var(--st-testing-ink);
+  --color-fd-warning: var(--st-staging-ink);
+  --color-fd-success: var(--st-merge-ink);
+  --color-fd-error: var(--st-eject-ink);
+  --color-fd-idea: var(--amber-400);
+
+  /* diffs land green / eject red, matching the train. */
+  --color-fd-diff-add: color-mix(in srgb, var(--st-merge) 14%, transparent);
+  --color-fd-diff-add-symbol: var(--st-merge-ink);
+  --color-fd-diff-remove: color-mix(in srgb, var(--st-eject) 14%, transparent);
+  --color-fd-diff-remove-symbol: var(--st-eject-ink);
+}
+
+/* Brand type: UI workhorse for prose, dense mono for code. */
+#nd-page,
+#nd-sidebar,
+#nd-toc {
+  font-family: var(--font-ui);
+}
+.prose code,
+.prose pre,
+.shiki,
+.shiki code,
+pre code,
+code {
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+}
+
+/* The hairline rail threaded into the docs chrome: a single editorial column rule
+   down the content, mirroring the dashboard train and the landing dividers. */
+#nd-page {
+  border-left: 1px solid var(--rule);
+}
+
+/* Page header — display heading + a quiet lede, in step with the app's h1 block. */
+.docs-title {
+  font-weight: var(--fw-black);
+  font-size: var(--text-3xl);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-display);
+  color: var(--text);
+}
+.docs-lead {
+  font-size: var(--text-lg);
+  line-height: var(--leading-relaxed);
+  color: var(--text-dim);
+}
+
+/* Active sidebar item: amber lamp — tint + ink + a welded rail bar on the edge. */
+a[data-active="true"] {
+  background-color: color-mix(in srgb, var(--primary) 14%, transparent);
+  color: var(--primary);
+  box-shadow: inset 2px 0 0 var(--primary);
+}
+
+/* Board voice for the small chrome labels — the unmistakable identity hit, scoped
+   to the codeblock filename and the table-of-contents heading. */
+.shiki figcaption,
+#nd-toc .toc-title {
+  font-family: var(--font-board);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--text-meta);
+}
+
+/* Code surface sits a step above base and carries the rail's hairline. */
+.shiki {
+  box-shadow: var(--elev-1);
+}
+.shiki figcaption {
+  color: var(--text-dim);
+}
