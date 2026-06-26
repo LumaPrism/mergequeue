@@ -118,7 +118,7 @@ export default function Landing() {
           </span>
         </Link>
         <div className="lp-nav-links">
-          <Link href="/docs">Docs</Link>
+          <a href={`${ASSET_BASE}/docs`}>Docs</a>
           {!STATIC_SITE && <Link href="/app">Dashboard</Link>}
           <a
             className="lp-icon-link"
@@ -158,10 +158,10 @@ export default function Landing() {
                 Star on GitHub
               </a>
               {STATIC_SITE ? (
-                <Link href="/docs" className="btn btn-ghost">
+                <a href={`${ASSET_BASE}/docs`} className="btn btn-ghost">
                   Open the docs
                   <span className="btn-arrow">→</span>
-                </Link>
+                </a>
               ) : (
                 <Link href="/app" className="btn btn-ghost">
                   Open the dashboard
@@ -305,9 +305,9 @@ export default function Landing() {
             Install the App
             <span className="btn-arrow">→</span>
           </a>
-          <Link href="/docs" className="btn btn-ghost">
+          <a href={`${ASSET_BASE}/docs`} className="btn btn-ghost">
             How it works
-          </Link>
+          </a>
         </div>
       </section>
 
@@ -317,7 +317,7 @@ export default function Landing() {
         </span>
         <span className="lp-foot-tag">ci-agnostic, self-hosted merge queue</span>
         <span className="lp-foot-links">
-          <Link href="/docs">Docs</Link>
+          <a href={`${ASSET_BASE}/docs`}>Docs</a>
           {!STATIC_SITE && <Link href="/app">Dashboard</Link>}
           <a
             className="lp-icon-link"
