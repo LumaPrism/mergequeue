@@ -7,6 +7,8 @@
 
 mod entity;
 
+pub use entity::queue_ledger;
+
 use std::collections::HashMap;
 
 use chrono::{DateTime, FixedOffset, Utc};
@@ -19,7 +21,7 @@ use uuid::Uuid;
 
 use crate::github::RepoId;
 use crate::queue::{
-    Batch, BatchState, BatchView, EntryState, EntryView, QueueEntry, RepoQueueConfig,
+    Batch, BatchState, BatchView, EntryState, EntryView, LedgerRecord, QueueEntry, RepoQueueConfig,
 };
 
 /// A repo with its live queue depth, for the dashboard's repo switcher.
@@ -171,12 +173,14 @@ impl Store {
             .collect();
         Ok(Some(BatchView {
             id: m.id,
+            repo_id: m.repo_id,
             state: m.state,
             base_sha: m.base_sha,
             staging_sha: m.staging_sha,
             staging_ref: m.staging_ref,
             merge_blocked: m.merge_blocked,
             entries,
+            created_at: m.created_at.with_timezone(&Utc),
         }))
     }
 
@@ -360,7 +364,56 @@ impl Store {
         Self::set_entries_state(c, ids, EntryState::Queued).await
     }
 
+    /// Append a finished batch's terminal outcome to the append-only ledger. The
+    /// FSM stays pure, so `ended_at` is stamped here at the IO boundary. `batch_id`
+    /// is UNIQUE and the engine replays effects on crash-resume, so a duplicate
+    /// append is a no-op (`ON CONFLICT DO NOTHING`).
+    pub async fn append_ledger<C: ConnectionTrait>(
+        c: &C,
+        record: &LedgerRecord,
+    ) -> Result<(), DbErr> {
+        let entries = serde_json::to_value(&record.entries)
+            .map_err(|e| DbErr::Custom(format!("serialize ledger entries: {e}")))?;
+        let res = entity::queue_ledger::Entity::insert(entity::queue_ledger::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            repo_id: Set(record.repo_id),
+            batch_id: Set(record.batch_id),
+            outcome: Set(record.outcome),
+            base_sha: Set(record.base_sha.clone()),
+            landed_sha: Set(record.landed_sha.clone()),
+            ejected_pr: Set(record.ejected_pr.map(|p| p as i64)),
+            entries: Set(entries),
+            started_at: Set(record.started_at.into()),
+            ended_at: Set(Utc::now().into()),
+        })
+        .on_conflict(
+            OnConflict::column(entity::queue_ledger::Column::BatchId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec(c)
+        .await;
+        match res {
+            Ok(_) | Err(DbErr::RecordNotInserted) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     // --- api / ui ---
+
+    /// The repo's most recent finished batch runs, newest first.
+    pub async fn list_ledger<C: ConnectionTrait>(
+        c: &C,
+        repo_id: Uuid,
+        limit: u64,
+    ) -> Result<Vec<entity::queue_ledger::Model>, DbErr> {
+        entity::queue_ledger::Entity::find()
+            .filter(entity::queue_ledger::Column::RepoId.eq(repo_id))
+            .order_by_desc(entity::queue_ledger::Column::EndedAt)
+            .limit(limit)
+            .all(c)
+            .await
+    }
 
     pub async fn list_entries<C: ConnectionTrait>(
         c: &C,
@@ -764,5 +817,144 @@ impl Store {
             .exec(c)
             .await?;
         Ok(res.rows_affected > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::LazyLock;
+
+    use chrono::{Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Set,
+        Statement,
+    };
+    use tokio::sync::Mutex as AsyncMutex;
+    use uuid::Uuid;
+
+    use super::{Store, entity};
+    use crate::queue::{LedgerEntry, LedgerEntryResult, LedgerOutcome, LedgerRecord};
+
+    /// Serializes DB tests against the shared test database.
+    static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    async fn test_db() -> DatabaseConnection {
+        let url = std::env::var("MQ_TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost:5433/mergequeue_test".into()
+        });
+        let (host, _) = url.rsplit_once('/').expect("db url has a path");
+        if let Ok(maint) = Database::connect(format!("{host}/postgres")).await {
+            let _ = maint
+                .execute(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "CREATE DATABASE mergequeue_test",
+                ))
+                .await;
+        }
+        let db = Database::connect(&url).await.expect("connect test db");
+        Migrator::up(&db, None).await.expect("migrate test db");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "TRUNCATE queue_ledger, batch_entries, batches, queue_entries, repos, installations \
+             CASCADE",
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn seed_repo(db: &DatabaseConnection) -> Uuid {
+        Store::provision_installation(db, 77, "acme").await.unwrap();
+        Store::upsert_repo(db, 77, "acme", "widgets").await.unwrap();
+        Store::repo_id_by_name(db, "acme", "widgets")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn record(repo_id: Uuid, batch_id: Uuid, outcome: LedgerOutcome) -> LedgerRecord {
+        LedgerRecord {
+            batch_id,
+            repo_id,
+            outcome,
+            base_sha: "base000".into(),
+            landed_sha: Some("stg777".into()),
+            ejected_pr: None,
+            entries: vec![
+                LedgerEntry {
+                    pr_number: 101,
+                    result: LedgerEntryResult::Landed,
+                },
+                LedgerEntry {
+                    pr_number: 102,
+                    result: LedgerEntryResult::Requeued,
+                },
+            ],
+            started_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_store_ledger_round_trips_one_record() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let repo_id = seed_repo(&db).await;
+        let rec = record(repo_id, Uuid::new_v4(), LedgerOutcome::Merged);
+        Store::append_ledger(&db, &rec).await.unwrap();
+
+        let rows = Store::list_ledger(&db, repo_id, 50).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.batch_id, rec.batch_id);
+        assert_eq!(row.outcome, LedgerOutcome::Merged);
+        assert_eq!(row.landed_sha.as_deref(), Some("stg777"));
+        assert!(row.ejected_pr.is_none());
+        let entries: Vec<LedgerEntry> = serde_json::from_value(row.entries.clone()).unwrap();
+        assert_eq!(entries, rec.entries);
+    }
+
+    #[tokio::test]
+    async fn test_store_ledger_append_twice_is_idempotent() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let repo_id = seed_repo(&db).await;
+        let rec = record(repo_id, Uuid::new_v4(), LedgerOutcome::Ejected);
+        Store::append_ledger(&db, &rec).await.unwrap();
+        Store::append_ledger(&db, &rec).await.unwrap();
+        let rows = Store::list_ledger(&db, repo_id, 50).await.unwrap();
+        assert_eq!(rows.len(), 1, "a duplicate batch_id append must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn test_store_ledger_list_orders_newest_first() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let repo_id = seed_repo(&db).await;
+        let base = Utc::now();
+        let mut ids = Vec::new();
+        for i in 0..3i64 {
+            let id = Uuid::new_v4();
+            ids.push(id);
+            entity::queue_ledger::ActiveModel {
+                id: Set(id),
+                repo_id: Set(repo_id),
+                batch_id: Set(Uuid::new_v4()),
+                outcome: Set(LedgerOutcome::Merged),
+                base_sha: Set("base000".into()),
+                landed_sha: Set(None),
+                ejected_pr: Set(None),
+                entries: Set(serde_json::json!([])),
+                started_at: Set(base.into()),
+                ended_at: Set((base + Duration::seconds(i)).into()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        let rows = Store::list_ledger(&db, repo_id, 2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, ids[2], "newest row comes first");
+        assert_eq!(rows[1].id, ids[1]);
     }
 }

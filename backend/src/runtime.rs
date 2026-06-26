@@ -20,7 +20,7 @@ use crate::error::Result;
 use crate::github::{
     AppClient, GitHubError, GitHubRepoClient, PullSummary, RepoClient, RepoId, TrainLabel,
 };
-use crate::queue::{BatchState, Engine, EntryState, QueueEntry};
+use crate::queue::{BatchState, Engine, EntryState, LedgerRecord, QueueEntry};
 use crate::setup::resolve_credentials;
 use crate::store::Store;
 
@@ -203,10 +203,11 @@ impl Runtime {
                 }
             }
             Some(EntryState::Testing) => {
-                let Some(batch) = Store::active_batch(&self.db, repo_id).await? else {
+                let Some(batch) = Store::active_batch_view(&self.db, repo_id).await? else {
                     return Ok(Removed::NotQueued);
                 };
-                if !batch.entry_ids.contains(&entry_id) {
+                let entry_ids = batch.entry_ids();
+                if !entry_ids.contains(&entry_id) {
                     return Ok(Removed::NotQueued);
                 }
                 if matches!(batch.state, BatchState::Merging) {
@@ -227,8 +228,7 @@ impl Runtime {
                         return Ok(Removed::Busy { pr });
                     }
                 }
-                let others: Vec<Uuid> = batch
-                    .entry_ids
+                let others: Vec<Uuid> = entry_ids
                     .iter()
                     .copied()
                     .filter(|id| *id != entry_id)
@@ -236,11 +236,13 @@ impl Runtime {
                 if let Some(client) = self.repo_client.read().await.clone() {
                     let gh = Store::repo_ref(&self.db, repo_id).await?;
                     let _ = client.delete_ref(&gh, &batch.staging_ref).await;
+                    let _ = client.delete_ref(&gh, &batch.assembly_ref()).await;
                 }
                 let txn = self.db.begin().await?;
                 Store::remove_entry(&txn, repo_id, entry_id).await?;
                 Store::requeue_entries(&txn, &others).await?;
                 Store::set_batch_state(&txn, batch.id, BatchState::Superseded).await?;
+                Store::append_ledger(&txn, &LedgerRecord::removed(&batch, pr)).await?;
                 txn.commit().await?;
                 for opr in Store::entry_prs(&self.db, &others)
                     .await

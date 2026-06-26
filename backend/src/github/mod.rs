@@ -24,6 +24,11 @@ pub enum GitHubError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A bare HTTP status with no backing octocrab error — lets callers react to a
+    /// known status (e.g. a hand-rolled REST call, or a synthetic error in tests).
+    #[error("github status {0}")]
+    Status(u16),
+
     #[error("github: {0}")]
     Other(String),
 }
@@ -44,7 +49,8 @@ impl GitHubError {
                 octocrab::Error::GitHub { source, .. } => Some(source.status_code.as_u16()),
                 _ => None,
             },
-            _ => None,
+            GitHubError::Status(code) => Some(*code),
+            GitHubError::Jwt(_) | GitHubError::Io(_) | GitHubError::Other(_) => None,
         }
     }
 }

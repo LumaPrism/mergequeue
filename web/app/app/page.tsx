@@ -30,30 +30,25 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 
+import { ActiveBatch } from "@/components/ActiveBatch";
+import { RunHistory } from "@/components/RunHistory";
 import { SetupGate } from "@/components/SetupGate";
 import {
   PrStatus,
   dequeue,
   enqueue,
+  getLedger,
   getMe,
   getOpenPrs,
   getQueue,
   getRepos,
   reorder,
 } from "@/lib/api";
-import type { EntryView, MeView, PrView, RepoView } from "@/lib/api";
+import type { EntryView, LedgerView, MeView, PrView, RepoView } from "@/lib/api";
+import { relTime } from "@/lib/rel-time";
 import { stateColor, statusColor, statusInk, svar } from "@/lib/state";
 
 const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
-
-function relTime(syncedAt: number | null, now: number): string {
-  if (syncedAt === null) return "—";
-  const s = Math.max(0, Math.round((now - syncedAt) / 1000));
-  if (s < 5) return "just now";
-  if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  return `${Math.round(s / 3600)}h ago`;
-}
 
 /// Loading placeholders sized to the real cars / PR cards, so swapping in content
 /// causes no layout shift. Its own component — any column drops it in.
@@ -513,6 +508,7 @@ export default function Dashboard() {
   const [undo, setUndo] = useState<{ entry: EntryView; index: number; repoId: string } | null>(
     null,
   );
+  const [ledger, setLedger] = useState<LedgerView[]>([]);
   const [syncedAt, setSyncedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
@@ -548,6 +544,12 @@ export default function Dashboard() {
         setPrsErr(true);
         setPrsReady(true);
       });
+    getLedger(repoId)
+      .then((l) => {
+        if (repoId !== selRef.current) return;
+        setLedger(l);
+      })
+      .catch(() => {});
   };
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
@@ -597,14 +599,13 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!sel) return;
-    // drop the previous repo's data so a failed/slow fetch never shows its cars
-    // under the newly selected repo.
     setQueue([]);
     setSyncedAt(null);
     setQueueErr(false);
     setPrs([]);
     setPrsErr(false);
     setPrsReady(false);
+    setLedger([]);
     refresh(sel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel]);
@@ -779,19 +780,6 @@ export default function Dashboard() {
   const draggingPr = dragId?.startsWith("pr:") ?? false;
   const dragPr = draggingPr ? prs.find((p) => `pr:${p.number}` === dragId) : null;
   const dragCar = dragId && !draggingPr ? queue.find((c) => c.id === dragId) : null;
-  const pipeCls = (stage: "staging" | "testing" | "merging") => {
-    if (stage === "staging") return batchStage ? "done" : "";
-    if (stage === "testing") {
-      if (batchStage === "testing") return "active";
-      if (batchStage === "merging" || batchStage === "merged") return "done";
-      if (batchStage === "ejected") return "danger";
-      return "";
-    }
-    if (batchStage === "merging") return "active";
-    if (batchStage === "merged") return "done";
-    return "";
-  };
-
   return (
     <main className="shell" inert={confirming ? true : undefined}>
       <header className="topbar">
@@ -894,81 +882,70 @@ export default function Dashboard() {
                 ) : queueLoading ? (
                   <Skeleton variant="car" count={3} />
                 ) : (
-                  <TrainZone active={draggingPr}>
-                    {queue.length === 0 ? (
-                      <div className="qempty">
-                        <span className="qempty-title">
-                          {prs.length === 0 ? "Nothing to board yet" : "The train is empty"}
-                        </span>
-                        <span className="qempty-sub">
-                          {prs.length === 0
-                            ? "Open a pull request, then add it here to start the train."
-                            : `Add a ready PR to start the train — cars land into ${repo?.baseBranch ?? "main"} in order.`}
-                        </span>
-                        {prs.length > 0 && shownPrs[0] ? (
-                          <button
-                            type="button"
-                            className="qempty-add"
-                            onClick={() => setConfirming(shownPrs[0])}
-                          >
-                            Add #{shownPrs[0].number}
-                          </button>
-                        ) : null}
-                      </div>
-                    ) : (
-                      <>
-                        {pinned.map((e, i) => (
-                          <div
-                            className={`node pr car pinned ${
-                              e.status === PrStatus.Merged ? "is-merged" : ""
-                            } ${e.status === PrStatus.Ejected ? "is-ejected" : ""}`}
-                            key={e.id}
-                            style={{ ...svar(statusColor[e.status]), ["--i"]: i } as CSSProperties}
-                          >
-                            <CarBody entry={e} pr={prByNum.get(e.prNumber)} href={ghUrl(e.prNumber)} />
-                            {(e.status === PrStatus.Testing ||
-                              e.status === PrStatus.Merging ||
-                              e.status === PrStatus.Blocked) && (
-                              <button
-                                type="button"
-                                className="car-x"
-                                aria-label={`remove #${e.prNumber}`}
-                                title="Remove — cancels the current batch"
-                                onClick={() => doRemove(e)}
-                              >
-                                ×
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                        {cars.length > 0 && (
-                          <div className="departure">
-                            <span className="departure-k">next departure</span>
-                            <span className="departure-n">
-                              {Math.min(batchSize || cars.length, cars.length)} cars
-                            </span>
-                            <span className="departure-rule" aria-hidden />
-                          </div>
-                        )}
-                        <SortableContext
-                          items={cars.map((c) => c.id)}
-                          strategy={verticalListSortingStrategy}
-                        >
-                          {cars.map((e, i) => (
-                            <Car
-                              key={e.id}
-                              entry={e}
-                              pr={prByNum.get(e.prNumber)}
-                              href={ghUrl(e.prNumber)}
-                              next={i < batchSize}
-                              index={pinned.length + i + 1}
-                              onRemove={doRemove}
-                            />
-                          ))}
-                        </SortableContext>
-                      </>
+                  <>
+                    {pinned.length > 0 && (
+                      <ActiveBatch
+                        pinned={pinned}
+                        head={batchHeadState}
+                        stage={batchStage}
+                        prByNum={prByNum}
+                        ghUrl={ghUrl}
+                        baseBranch={repo?.baseBranch}
+                        onRemove={doRemove}
+                      />
                     )}
-                  </TrainZone>
+                    <TrainZone active={draggingPr}>
+                      {queue.length === 0 ? (
+                        <div className="qempty">
+                          <span className="qempty-title">
+                            {prs.length === 0 ? "Nothing to board yet" : "The train is empty"}
+                          </span>
+                          <span className="qempty-sub">
+                            {prs.length === 0
+                              ? "Open a pull request, then add it here to start the train."
+                              : `Add a ready PR to start the train — cars land into ${repo?.baseBranch ?? "main"} in order.`}
+                          </span>
+                          {prs.length > 0 && shownPrs[0] ? (
+                            <button
+                              type="button"
+                              className="qempty-add"
+                              onClick={() => setConfirming(shownPrs[0])}
+                            >
+                              Add #{shownPrs[0].number}
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <>
+                          {cars.length > 0 && (
+                            <div className="departure">
+                              <span className="departure-k">next departure</span>
+                              <span className="departure-n">
+                                {Math.min(batchSize || cars.length, cars.length)} cars
+                              </span>
+                              <span className="departure-rule" aria-hidden />
+                            </div>
+                          )}
+                          <SortableContext
+                            items={cars.map((c) => c.id)}
+                            strategy={verticalListSortingStrategy}
+                          >
+                            {cars.map((e, i) => (
+                              <Car
+                                key={e.id}
+                                entry={e}
+                                pr={prByNum.get(e.prNumber)}
+                                href={ghUrl(e.prNumber)}
+                                next={i < batchSize}
+                                index={pinned.length + i + 1}
+                                onRemove={doRemove}
+                              />
+                            ))}
+                          </SortableContext>
+                        </>
+                      )}
+                    </TrainZone>
+                  </>
                 )}
               </div>
 
@@ -1019,52 +996,6 @@ export default function Dashboard() {
                   )}
                 </div>
 
-                <div className="card">
-                  <h2 className="card-title">active batch</h2>
-                  {batchStage && repo ? (
-                    <>
-                      <div className="batch-head">
-                        <span className="t">
-                          {pinned.length} {pinned.length === 1 ? "car" : "cars"} → {repo.baseBranch}
-                        </span>
-                        {batchHeadState ? <FlipTag value={batchHeadState} className="st" /> : null}
-                      </div>
-                      <div className="pipe">
-                        <span className={`pill ${pipeCls("staging")}`}>Staging</span>
-                        <span className={`arrow ${batchStage === "testing" ? "hot" : ""}`} />
-                        <span className={`pill ${pipeCls("testing")}`}>Testing</span>
-                        <span className={`arrow ${batchStage === "merging" ? "hot" : ""}`} />
-                        <span className={`pill ${pipeCls("merging")}`}>Merging</span>
-                      </div>
-                      <div className="batch-prs">
-                        {pinned.map((e) => (
-                          <div className="bpr" key={e.id}>
-                            <span className="num">#{e.prNumber}</span>
-                            <span className="ttl">
-                              {prByNum.get(e.prNumber)?.title ?? `PR #${e.prNumber}`}
-                            </span>
-                            <FlipTag value={e.status} className="tag mini" />
-                          </div>
-                        ))}
-                      </div>
-                      {batchStage === "ejected" ? (
-                        <div className="hrow">
-                          <span className="res ejected">ejected</span>
-                          <span>breaker isolated; the survivors re-queue and roll on.</span>
-                        </div>
-                      ) : batchStage === "merged" ? (
-                        <div className="hrow">
-                          <span className="res merged">merged</span>
-                          <span>batch landed on {repo.baseBranch}.</span>
-                        </div>
-                      ) : null}
-                    </>
-                  ) : (
-                    <div className="detail-sub">
-                      No batch in flight. Add cars and they&apos;ll stage, test, and land here.
-                    </div>
-                  )}
-                </div>
               </aside>
             </div>
 
@@ -1084,6 +1015,7 @@ export default function Dashboard() {
               ) : null}
             </DragOverlay>
           </DndContext>
+          <RunHistory rows={ledger} />
         </>
       )}
 

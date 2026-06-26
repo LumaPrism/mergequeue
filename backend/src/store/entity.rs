@@ -108,6 +108,34 @@ pub mod batch {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod queue_ledger {
+    use sea_orm::entity::prelude::*;
+
+    use crate::queue::LedgerOutcome;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "queue_ledger")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub repo_id: Uuid,
+        #[sea_orm(unique)]
+        pub batch_id: Uuid,
+        pub outcome: LedgerOutcome,
+        pub base_sha: String,
+        pub landed_sha: Option<String>,
+        pub ejected_pr: Option<i64>,
+        pub entries: Json,
+        pub started_at: DateTimeWithTimeZone,
+        pub ended_at: DateTimeWithTimeZone,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod batch_entry {
     use sea_orm::entity::prelude::*;
 

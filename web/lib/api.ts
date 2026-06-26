@@ -4,6 +4,7 @@
 import type {
   EntryView,
   EnqueueRequest,
+  LedgerView,
   MeView,
   PrView,
   ReorderRequest,
@@ -14,13 +15,14 @@ import type {
 export type {
   EntryView,
   EnqueueRequest,
+  LedgerView,
   MeView,
   PrView,
   ReorderRequest,
   RepoView,
   SetupStatus,
 } from "./api-types";
-export { EntryState, BatchState, MergeMethod, PrStatus, SetupSource } from "./api-types";
+export { EntryState, BatchState, LedgerEntryResult, LedgerOutcome, MergeMethod, PrStatus, SetupSource } from "./api-types";
 
 // Server components fetch the backend directly (absolute); client-side calls use
 // the same-origin "/api" rewrite (see next.config.mjs).
@@ -89,6 +91,12 @@ export async function reorder(repoId: string, entryIds: string[]): Promise<Entry
 export async function dequeue(repoId: string, entryId: string): Promise<void> {
   const res = await fetch(`${base}/repos/${repoId}/queue/${entryId}`, { method: "DELETE" });
   if (!res.ok) throw new Error(`dequeue failed: ${res.status}`);
+}
+
+export async function getLedger(repoId: string): Promise<LedgerView[]> {
+  const res = await fetch(`${base}/repos/${repoId}/ledger`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`getLedger failed: ${res.status}`);
+  return res.json();
 }
 
 // TODO: listOpenPrs filtering, getBatches — match api/mod.rs as it fills in.

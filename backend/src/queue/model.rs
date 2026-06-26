@@ -194,6 +194,26 @@ impl MergeMethod {
     }
 }
 
+/// Terminal outcome recorded in the append-only `queue_ledger` table.
+#[typeshare]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum, EnumIter, DeriveActiveEnum,
+)]
+#[serde(rename_all = "lowercase")]
+#[oai(rename_all = "lowercase")]
+#[sea_orm(rs_type = "String", db_type = "Enum", enum_name = "ledger_outcome")]
+pub enum LedgerOutcome {
+    /// All PRs in the batch landed on the base branch.
+    #[sea_orm(string_value = "merged")]
+    Merged,
+    /// A culprit PR was ejected; the remainder was re-queued.
+    #[sea_orm(string_value = "ejected")]
+    Ejected,
+    /// The batch was abandoned because the base moved or it was overtaken.
+    #[sea_orm(string_value = "superseded")]
+    Superseded,
+}
+
 /// Per-repo queue settings (persisted; editable from the UI).
 #[derive(Debug, Clone)]
 pub struct RepoQueueConfig {

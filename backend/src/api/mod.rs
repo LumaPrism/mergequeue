@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use poem::http::StatusCode;
 use poem::{Error, Result};
-use poem_openapi::param::{Cookie, Path};
+use poem_openapi::param::{Cookie, Path, Query};
 use poem_openapi::payload::Json;
 use poem_openapi::{Enum, Object, OpenApi};
 use sea_orm::{DatabaseConnection, TransactionTrait};
@@ -18,10 +18,12 @@ use crate::auth::current_user;
 use crate::config::Config;
 use crate::error::Error as AppError;
 use crate::github::PullSummary;
-use crate::queue::{BatchState, BatchView, EntryState, QueueEntry};
+use crate::queue::{
+    BatchState, BatchView, EntryState, LedgerEntryResult, LedgerOutcome, QueueEntry,
+};
 use crate::runtime::{AppOwner, Enqueued, Removed, Runtime};
 use crate::setup::resolve_credentials;
-use crate::store::{RepoSummary, Store};
+use crate::store::{RepoSummary, Store, queue_ledger};
 
 pub struct Api {
     pub cfg: Config,
@@ -84,6 +86,51 @@ impl EntryView {
             id: e.id.to_string(),
             pr_number: e.pr_number as u32,
             position: e.position,
+        }
+    }
+}
+
+/// One PR's fate within a finished batch run, projected from the ledger.
+#[typeshare]
+#[derive(Serialize, Deserialize, Object)]
+#[serde(rename_all = "camelCase")]
+#[oai(rename_all = "camelCase")]
+pub struct LedgerEntryView {
+    #[typeshare(serialized_as = "u32")]
+    pub pr_number: u64,
+    pub result: LedgerEntryResult,
+}
+
+/// One finished batch run from the append-only ledger (the dashboard's history view).
+#[typeshare]
+#[derive(Serialize, Object)]
+#[serde(rename_all = "camelCase")]
+#[oai(rename_all = "camelCase")]
+pub struct LedgerView {
+    pub id: String,
+    pub batch_id: String,
+    pub outcome: LedgerOutcome,
+    pub base_sha: String,
+    pub landed_sha: Option<String>,
+    #[typeshare(serialized_as = "Option<u32>")]
+    pub ejected_pr: Option<u64>,
+    pub entries: Vec<LedgerEntryView>,
+    pub started_at: String,
+    pub ended_at: String,
+}
+
+impl LedgerView {
+    fn project(m: queue_ledger::Model) -> Self {
+        Self {
+            id: m.id.to_string(),
+            batch_id: m.batch_id.to_string(),
+            outcome: m.outcome,
+            base_sha: m.base_sha,
+            landed_sha: m.landed_sha,
+            ejected_pr: m.ejected_pr.map(|p| p as u64),
+            entries: serde_json::from_value(m.entries).unwrap_or_default(),
+            started_at: m.started_at.to_rfc3339(),
+            ended_at: m.ended_at.to_rfc3339(),
         }
     }
 }
@@ -365,6 +412,24 @@ impl Api {
         Ok(Json(views))
     }
 
+    /// Recent finished batch runs for a repo, newest first (the dashboard's history
+    /// view). `limit` defaults to 50 and is capped at 200.
+    #[oai(path = "/repos/:repo_id/ledger", method = "get")]
+    async fn get_ledger(
+        &self,
+        repo_id: Path<String>,
+        limit: Query<Option<u64>>,
+        #[oai(name = "mq_session")] session: Cookie<Option<String>>,
+    ) -> Result<Json<Vec<LedgerView>>> {
+        self.require_session(&session).await?;
+        let repo_id = Self::parse_repo(&repo_id.0)?;
+        let limit = limit.0.unwrap_or(50).min(200);
+        let rows = Store::list_ledger(&self.db, repo_id, limit)
+            .await
+            .map_err(Self::db_err)?;
+        Ok(Json(rows.into_iter().map(LedgerView::project).collect()))
+    }
+
     /// Add a PR to the queue. Validates the PR's base matches the queue before
     /// accepting it (a PR into another branch is rejected, not merged into base).
     #[oai(path = "/repos/:repo_id/queue", method = "post")]
@@ -468,4 +533,172 @@ impl Api {
 
     // TODO:
     //   GET /repos/:repo_id/batches            → active + recent batch history
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, LazyLock};
+
+    use chrono::{DateTime, Duration, Utc};
+    use migration::{Migrator, MigratorTrait};
+    use poem::http::StatusCode;
+    use poem_openapi::param::{Cookie, Path, Query};
+    use sea_orm::{
+        ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Set,
+        Statement,
+    };
+    use secrecy::SecretString;
+    use tokio::sync::Mutex as AsyncMutex;
+    use uuid::Uuid;
+
+    use super::Api;
+    use crate::auth;
+    use crate::config::{Config, DatabaseConfig, ServerConfig};
+    use crate::queue::LedgerOutcome;
+    use crate::runtime::Runtime;
+    use crate::store::{Store, queue_ledger};
+
+    /// Serializes DB tests against the shared test database.
+    static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    async fn test_db() -> DatabaseConnection {
+        let url = std::env::var("MQ_TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost:5433/mergequeue_test".into()
+        });
+        let (host, _) = url.rsplit_once('/').expect("db url has a path");
+        if let Ok(maint) = Database::connect(format!("{host}/postgres")).await {
+            let _ = maint
+                .execute(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "CREATE DATABASE mergequeue_test",
+                ))
+                .await;
+        }
+        let db = Database::connect(&url).await.expect("connect test db");
+        Migrator::up(&db, None).await.expect("migrate test db");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "TRUNCATE queue_ledger, batch_entries, batches, queue_entries, sessions, users, repos, \
+             installations CASCADE",
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    fn test_api(db: DatabaseConnection) -> Api {
+        let cfg = Config {
+            github: None,
+            server: ServerConfig {
+                base_url: "http://localhost:8080".into(),
+                public_url: None,
+                app_url: None,
+                port: 8080,
+            },
+            database: DatabaseConfig {
+                url: SecretString::from("postgres://test"),
+            },
+        };
+        let rt = Arc::new(Runtime::new(cfg.clone(), db.clone()));
+        Api { cfg, db, rt }
+    }
+
+    async fn seed_repo(db: &DatabaseConnection) -> Uuid {
+        Store::provision_installation(db, 88, "acme").await.unwrap();
+        Store::upsert_repo(db, 88, "acme", "widgets").await.unwrap();
+        Store::repo_id_by_name(db, "acme", "widgets")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    async fn seed_session(db: &DatabaseConnection) -> Uuid {
+        let user_pk = Uuid::new_v4();
+        auth::user::ActiveModel {
+            id: Set(user_pk),
+            github_id: Set(4242),
+            login: Set("octocat".into()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        let sid = Uuid::new_v4();
+        auth::session::ActiveModel {
+            id: Set(sid),
+            user_pk: Set(user_pk),
+            expires_at: Set((Utc::now() + Duration::days(1)).into()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        sid
+    }
+
+    async fn insert_ledger(
+        db: &DatabaseConnection,
+        repo_id: Uuid,
+        ended_at: DateTime<Utc>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        queue_ledger::ActiveModel {
+            id: Set(id),
+            repo_id: Set(repo_id),
+            batch_id: Set(Uuid::new_v4()),
+            outcome: Set(LedgerOutcome::Merged),
+            base_sha: Set("base000".into()),
+            landed_sha: Set(Some("stg".into())),
+            ejected_pr: Set(None),
+            entries: Set(serde_json::json!([{"prNumber": 7, "result": "landed"}])),
+            started_at: Set(ended_at.into()),
+            ended_at: Set(ended_at.into()),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn test_api_ledger_returns_rows_newest_first_for_session() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = test_api(db.clone());
+        let repo_id = seed_repo(&db).await;
+        let sid = seed_session(&db).await;
+        let base = Utc::now();
+        let older = insert_ledger(&db, repo_id, base).await;
+        let newer = insert_ledger(&db, repo_id, base + Duration::seconds(5)).await;
+
+        let views = api
+            .get_ledger(
+                Path(repo_id.to_string()),
+                Query(None),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, newer.to_string(), "newest run first");
+        assert_eq!(views[1].id, older.to_string());
+        assert_eq!(views[0].entries.len(), 1);
+        assert_eq!(views[0].entries[0].pr_number, 7);
+    }
+
+    #[tokio::test]
+    async fn test_api_ledger_rejects_missing_session() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = test_api(db.clone());
+        let repo_id = seed_repo(&db).await;
+
+        let err = api
+            .get_ledger(Path(repo_id.to_string()), Query(None), Cookie(None))
+            .await
+            .err()
+            .expect("a missing session must be rejected");
+        assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
 }

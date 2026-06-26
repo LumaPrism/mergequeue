@@ -697,6 +697,164 @@ body::before {
   color: var(--st-eject-ink);
   background: color-mix(in srgb, var(--st-eject) var(--tint-bg-pct), transparent);
 }
+.hrow .res.superseded {
+  color: var(--st-superseded-ink);
+  background: color-mix(in srgb, var(--st-superseded) var(--tint-bg-pct), transparent);
+}
+
+/* ---- recent-runs history panel ---- */
+.history {
+  margin-top: var(--s-8);
+  padding-top: var(--s-5);
+  border-top: 1px solid var(--line);
+  animation: rise var(--dur-4) var(--ease) backwards;
+}
+.history-title {
+  display: block;
+  margin-bottom: var(--s-1);
+  font-family: var(--font-board);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--text-meta);
+  font-weight: var(--fw-regular);
+}
+.hrow-prs {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+}
+.hrow-tail {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-meta);
+  background: color-mix(in srgb, #fff 4%, transparent);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  padding: 2px 7px;
+}
+.hrow-when {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-meta);
+  white-space: nowrap;
+}
+
+/* ---- active-batch hero ---- */
+.activebatch {
+  position: relative;
+  border-radius: var(--r-lg);
+  border: 1px solid color-mix(in srgb, var(--s) 40%, transparent);
+  background: color-mix(in srgb, var(--s) 6%, var(--surface));
+  backdrop-filter: blur(10px);
+  overflow: hidden;
+  box-shadow:
+    var(--elev-1),
+    0 0 48px -16px color-mix(in srgb, var(--s) 30%, transparent);
+  animation: rise var(--dur-4) var(--ease) backwards;
+}
+
+.ab-banner {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--s-5);
+  padding: var(--s-5) var(--s-6) var(--s-5) calc(var(--s-6) + 5px);
+  background: color-mix(in srgb, var(--s) 16%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--s) 22%, transparent);
+}
+
+.ab-banner::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--s);
+  box-shadow: 0 0 18px 0 color-mix(in srgb, var(--s) 80%, transparent);
+}
+
+.ab-state {
+  font-family: var(--font-board);
+  font-size: var(--text-3xl);
+  font-weight: var(--fw-black);
+  letter-spacing: var(--tracking-board);
+  color: var(--s-ink, var(--s));
+  line-height: 1;
+}
+
+.ab-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: color-mix(in srgb, var(--s-ink, var(--s)) 55%, var(--text-meta));
+  margin-left: auto;
+}
+
+.ab-reason {
+  margin: 0;
+  padding: var(--s-3) var(--s-6);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--s-ink, var(--s));
+  background: color-mix(in srgb, var(--s) 8%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--s) 16%, transparent);
+}
+
+.activebatch .pipe.ab-progress {
+  margin-bottom: 0;
+  padding: var(--s-4) var(--s-6);
+  border-bottom: 1px solid var(--line);
+}
+
+.ab-prs {
+  display: flex;
+  flex-direction: column;
+}
+
+.ab-pr {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-6);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-sm);
+}
+
+.ab-pr:last-child {
+  border-bottom: none;
+}
+
+.ab-pr-num {
+  font-family: var(--font-board);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "zero" 1;
+  font-size: var(--text-xs);
+  color: var(--accent);
+  flex: none;
+}
+
+.ab-pr-ttl {
+  flex: 1;
+  color: var(--text);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ab-result {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-6);
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  border-top: 1px solid var(--line);
+}
 
 /* ---- train cars ---- */
 .node.pr {

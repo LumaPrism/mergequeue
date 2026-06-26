@@ -141,7 +141,7 @@ impl Engine {
                         base_ref: pull.base_ref,
                     });
                 }
-                let staging_sha = self.repo.base_sha(gh, &batch.staging_ref).await?;
+                let staging_sha = self.repo.base_sha(gh, &batch.assembly_ref()).await?;
                 Ok(Fact::StageFinalize { staging_sha })
             }
             BatchState::Testing => {
@@ -239,13 +239,17 @@ impl Engine {
                 Store::set_entries_state(c, &entry_ids, state).await?
             }
             DbWrite::RequeueEntries { entry_ids } => Store::requeue_entries(c, &entry_ids).await?,
+            DbWrite::AppendLedger(record) => Store::append_ledger(c, &record).await?,
         }
         Ok(())
     }
 
     /// Run one GitHub effect. `ForceRef`/`MergeOnto`/`FastForward` are fatal on
     /// error (they propagate), except a *rejected* fast-forward, which round-trips
-    /// as `FfRejected` instead of wedging the tick. The rest are best-effort.
+    /// as `FfRejected` instead of wedging the tick. A `MergeOnto` that 404s because
+    /// its assembly ref is missing (a batch staged by the pre-assembly-ref engine)
+    /// seeds that ref from the in-flight staging ref and retries once. The rest are
+    /// best-effort.
     async fn apply_gh(&self, gh: &RepoId, call: GhCall) -> Result<Option<StepReport>, EngineError> {
         match call {
             GhCall::ForceRef { staging_ref, sha } => {
@@ -258,17 +262,32 @@ impl Engine {
                 message,
                 entry_id,
                 pr_number,
-            } => {
-                let outcome = self
-                    .repo
-                    .merge_onto(gh, &staging_ref, &head, &message)
-                    .await?;
-                Ok(Some(StepReport::Merged(MergeReport {
+                seed_from,
+            } => match self
+                .repo
+                .merge_onto(gh, &staging_ref, &head, &message)
+                .await
+            {
+                Ok(outcome) => Ok(Some(StepReport::Merged(MergeReport {
                     entry_id,
                     pr_number,
                     outcome,
-                })))
-            }
+                }))),
+                Err(e) if e.status() == Some(404) => {
+                    let tip = self.repo.base_sha(gh, &seed_from).await?;
+                    self.repo.force_ref(gh, &staging_ref, &tip).await?;
+                    let outcome = self
+                        .repo
+                        .merge_onto(gh, &staging_ref, &head, &message)
+                        .await?;
+                    Ok(Some(StepReport::Merged(MergeReport {
+                        entry_id,
+                        pr_number,
+                        outcome,
+                    })))
+                }
+                Err(e) => Err(e.into()),
+            },
             GhCall::FastForward { base_branch, sha } => {
                 match self.repo.fast_forward(gh, &base_branch, &sha).await {
                     Ok(()) => Ok(None),
@@ -378,13 +397,12 @@ mod tests {
             Ok(vec![])
         }
         async fn base_sha(&self, _: &RepoId, base: &str) -> Result<String, GitHubError> {
-            Ok(self
-                .refs
+            self.refs
                 .lock()
                 .unwrap()
                 .get(base)
                 .cloned()
-                .unwrap_or_else(|| "base000".into()))
+                .ok_or(GitHubError::Status(404))
         }
         async fn pull(&self, _: &RepoId, pr: u64) -> Result<PullSummary, GitHubError> {
             Ok(PullSummary {
@@ -405,11 +423,13 @@ mod tests {
             _: &str,
         ) -> Result<MergeOutcome, GitHubError> {
             self.log(format!("merge_onto {branch} {head}"));
+            let mut refs = self.refs.lock().unwrap();
+            let Some(tip) = refs.get(branch).cloned() else {
+                return Err(GitHubError::Status(404));
+            };
             if self.merge == MergeOutcome::Conflicted {
                 return Ok(MergeOutcome::Conflicted);
             }
-            let mut refs = self.refs.lock().unwrap();
-            let tip = refs.get(branch).cloned().unwrap_or_default();
             if !tip.contains(&format!("+{head}")) {
                 refs.insert(branch.to_string(), format!("{tip}+{head}"));
             }
@@ -554,10 +574,67 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "merge_onto mq/staging/main head101")
+                .any(|c| c == "merge_onto mq-tmp/staging/main head101")
         );
         assert!(calls.iter().any(|c| c.starts_with("fast_forward")));
         assert!(Store::list_entries(&db, repo_id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_engine_assembles_on_silent_ref_and_flips_staging_at_finalize() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let repo_id = seed_repo(&db, 1).await;
+        Store::enqueue(&db, repo_id, 101, "h101", "alice")
+            .await
+            .unwrap();
+
+        let fake = std::sync::Arc::new(Fake::new(CheckState::Pending));
+        let engine = Engine::new(fake.clone(), db.clone());
+
+        let out = engine.tick(repo_id).await.unwrap();
+        assert!(matches!(out, TickOutcome::Staged { .. }));
+
+        let calls = fake.calls();
+
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "merge_onto mq-tmp/staging/main head101"),
+            "PRs are assembled onto the CI-silent assembly ref"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("merge_onto mq/staging/main ")),
+            "no merge ever targets the real staging ref"
+        );
+
+        let flip = calls
+            .iter()
+            .position(|c| c.starts_with("force_ref mq/staging/main "))
+            .expect("the real staging ref is flipped to the assembled tip at finalize");
+        let drop = calls
+            .iter()
+            .position(|c| c == "delete_ref mq-tmp/staging/main")
+            .expect("the assembly ref is deleted at finalize");
+        assert!(
+            flip < drop,
+            "the staging flip happens before the assembly ref is dropped"
+        );
+
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c == "force_ref mq/staging/main base000"),
+            "the real staging ref is never force-set to a bare base SHA"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "force_ref mq-tmp/staging/main base000"),
+            "the bare base is reset on the silent assembly ref instead"
+        );
     }
 
     #[tokio::test]
@@ -852,14 +929,18 @@ mod tests {
             .unwrap();
 
         let fake = std::sync::Arc::new(Fake::new(CheckState::Pending));
+        fake.refs
+            .lock()
+            .unwrap()
+            .insert("mq-tmp/staging/main".into(), "base000".into());
         let engine = Engine::new(fake.clone(), db.clone());
         let out = engine.tick(repo_id).await.unwrap();
 
         assert_eq!(out, TickOutcome::Staged { batch: batch.id });
         let calls = fake.calls();
         assert!(
-            !calls.iter().any(|c| c.starts_with("force_ref")),
-            "resume must not reset the staging branch"
+            !calls.iter().any(|c| c.starts_with("force_ref mq-tmp/")),
+            "resume must not re-reset the assembly branch to the base tip"
         );
         assert!(
             !calls.iter().any(|c| c.starts_with("merge_onto")),
@@ -888,6 +969,10 @@ mod tests {
         Store::mark_entry_staged(&db, batch.id, a.id).await.unwrap();
 
         let fake = std::sync::Arc::new(Fake::new(CheckState::Pending));
+        fake.refs
+            .lock()
+            .unwrap()
+            .insert("mq-tmp/staging/main".into(), "base000+head401".into());
         let engine = Engine::new(fake.clone(), db.clone());
         engine.tick(repo_id).await.unwrap();
 
@@ -895,14 +980,57 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|c| c == "merge_onto mq/staging/main head402"),
+                .any(|c| c == "merge_onto mq-tmp/staging/main head402"),
             "the unstaged head must merge"
         );
         assert!(
             !calls
                 .iter()
-                .any(|c| c == "merge_onto mq/staging/main head401"),
+                .any(|c| c == "merge_onto mq-tmp/staging/main head401"),
             "the already-staged head must not re-merge"
+        );
+    }
+
+    /// A batch left mid-staging by the pre-assembly-ref engine (base_sha set, so the
+    /// reset is skipped; progress on the published staging ref; assembly ref absent)
+    /// seeds the assembly ref from the staging tip and merges instead of wedging.
+    #[tokio::test]
+    async fn test_engine_seeds_assembly_for_inflight_batch() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let repo_id = seed_repo(&db, 1).await;
+        let entry = Store::enqueue(&db, repo_id, 271, "h271", "quinn")
+            .await
+            .unwrap();
+        Store::create_batch(&db, repo_id, &[entry.id], "mq/staging/main")
+            .await
+            .unwrap();
+        let batch = Store::active_batch(&db, repo_id).await.unwrap().unwrap();
+        Store::set_batch_base_sha(&db, batch.id, "base000")
+            .await
+            .unwrap();
+
+        let fake = std::sync::Arc::new(Fake::new(CheckState::Pending));
+        fake.refs
+            .lock()
+            .unwrap()
+            .insert("mq/staging/main".into(), "inflight777".into());
+        let engine = Engine::new(fake.clone(), db.clone());
+        let out = engine.tick(repo_id).await.unwrap();
+
+        assert_eq!(out, TickOutcome::Staged { batch: batch.id });
+        let calls = fake.calls();
+        let seed = calls
+            .iter()
+            .position(|c| c == "force_ref mq-tmp/staging/main inflight777")
+            .expect("the missing assembly ref is seeded from the in-flight staging tip");
+        let merged = calls
+            .iter()
+            .rposition(|c| c == "merge_onto mq-tmp/staging/main head271")
+            .expect("the unstaged head merges onto the seeded assembly ref");
+        assert!(
+            seed < merged,
+            "the engine seeds the assembly ref before the merge that lands the head"
         );
     }
 }

@@ -12,9 +12,13 @@
 
 use std::collections::BTreeSet;
 
+use chrono::{DateTime, Utc};
+use poem_openapi::Enum;
+use serde::{Deserialize, Serialize};
+use typeshare::typeshare;
 use uuid::Uuid;
 
-use super::model::{BatchState, EntryState, RepoQueueConfig, TickOutcome};
+use super::model::{BatchState, EntryState, LedgerOutcome, RepoQueueConfig, TickOutcome};
 use crate::github::{CheckState, MergeOutcome, TrainLabel};
 
 /// The commit-status context the pre-labels version posted on PR heads. It is not
@@ -36,6 +40,8 @@ pub enum Observation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchView {
     pub id: Uuid,
+    /// The repo this batch belongs to — carried into the ledger record.
+    pub repo_id: Uuid,
     pub state: BatchState,
     /// Base tip captured at the reset step; empty until then (race guard inactive).
     pub base_sha: String,
@@ -46,6 +52,8 @@ pub struct BatchView {
     pub merge_blocked: bool,
     /// Entries in queue (`ord`) order, with per-PR staging progress.
     pub entries: Vec<EntryView>,
+    /// When the batch was created — the ledger record's `started_at`.
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +76,16 @@ impl BatchView {
     /// The lowest-`ord` entry whose head isn't on staging yet.
     pub fn next_unstaged(&self) -> Option<&EntryView> {
         self.entries.iter().find(|e| !e.staged)
+    }
+
+    /// The CI-silent ref the batch is assembled on before the staged tip is
+    /// flipped onto `staging_ref`. Derived from `staging_ref` (not live config) so
+    /// a mid-batch config change can't split assembly from publication.
+    pub fn assembly_ref(&self) -> String {
+        match self.staging_ref.split_once('/') {
+            Some((head, rest)) => format!("{head}-tmp/{rest}"),
+            None => format!("{}-tmp", self.staging_ref),
+        }
     }
 }
 
@@ -169,6 +187,149 @@ pub enum DbWrite {
     RequeueEntries {
         entry_ids: Vec<Uuid>,
     },
+    /// Append the terminal outcome of a batch's run to the append-only ledger.
+    AppendLedger(LedgerRecord),
+}
+
+/// What happened to one PR in a finished batch run, snapshotted into the ledger.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
+#[serde(rename_all = "lowercase")]
+#[oai(rename_all = "lowercase")]
+pub enum LedgerEntryResult {
+    /// The PR landed on the base branch with its batch.
+    Landed,
+    /// The PR was identified as the batch breaker and removed from the queue.
+    Ejected,
+    /// The PR went back to the queue to be retried in a later batch.
+    Requeued,
+    /// The PR was manually pulled from its in-flight batch (dashboard remove or
+    /// a PR-close webhook) — it left the queue rather than going back to it.
+    Removed,
+}
+
+/// One PR's fate within a single ledger record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LedgerEntry {
+    pub pr_number: u64,
+    pub result: LedgerEntryResult,
+}
+
+/// The append-only record of how one batch's run ended. Built by `decide` at the
+/// points a run reaches a meaningful outcome and emitted as `DbWrite::AppendLedger`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LedgerRecord {
+    pub batch_id: Uuid,
+    pub repo_id: Uuid,
+    pub outcome: LedgerOutcome,
+    pub base_sha: String,
+    pub landed_sha: Option<String>,
+    pub ejected_pr: Option<u64>,
+    pub entries: Vec<LedgerEntry>,
+    pub started_at: DateTime<Utc>,
+}
+
+impl LedgerRecord {
+    /// The whole batch landed: every PR is `Landed` and `landed_sha` is the staging
+    /// tip that was fast-forwarded onto the base branch.
+    pub fn merged(batch: &BatchView, staging_sha: &str) -> Self {
+        let entries = batch
+            .entries
+            .iter()
+            .map(|e| LedgerEntry {
+                pr_number: e.pr_number,
+                result: LedgerEntryResult::Landed,
+            })
+            .collect();
+        Self {
+            batch_id: batch.id,
+            repo_id: batch.repo_id,
+            outcome: LedgerOutcome::Merged,
+            base_sha: batch.base_sha.clone(),
+            landed_sha: Some(staging_sha.to_owned()),
+            ejected_pr: None,
+            entries,
+            started_at: batch.created_at,
+        }
+    }
+
+    /// One culprit was ejected: `culprit_pr` is `Ejected`, every other PR is
+    /// `Requeued` to be retried in a later batch.
+    pub fn ejected(batch: &BatchView, culprit_pr: u64) -> Self {
+        let entries = batch
+            .entries
+            .iter()
+            .map(|e| LedgerEntry {
+                pr_number: e.pr_number,
+                result: if e.pr_number == culprit_pr {
+                    LedgerEntryResult::Ejected
+                } else {
+                    LedgerEntryResult::Requeued
+                },
+            })
+            .collect();
+        Self {
+            batch_id: batch.id,
+            repo_id: batch.repo_id,
+            outcome: LedgerOutcome::Ejected,
+            base_sha: batch.base_sha.clone(),
+            landed_sha: None,
+            ejected_pr: Some(culprit_pr),
+            entries,
+            started_at: batch.created_at,
+        }
+    }
+
+    /// The batch was abandoned (base moved or it was overtaken): every PR is
+    /// `Requeued`.
+    pub fn superseded(batch: &BatchView) -> Self {
+        let entries = batch
+            .entries
+            .iter()
+            .map(|e| LedgerEntry {
+                pr_number: e.pr_number,
+                result: LedgerEntryResult::Requeued,
+            })
+            .collect();
+        Self {
+            batch_id: batch.id,
+            repo_id: batch.repo_id,
+            outcome: LedgerOutcome::Superseded,
+            base_sha: batch.base_sha.clone(),
+            landed_sha: None,
+            ejected_pr: None,
+            entries,
+            started_at: batch.created_at,
+        }
+    }
+
+    /// A batch dissolved by a manual removal of one in-flight PR: the pulled PR is
+    /// recorded as `Removed`, every sibling as `Requeued` (it returns to the queue).
+    pub fn removed(batch: &BatchView, removed_pr: u64) -> Self {
+        let entries = batch
+            .entries
+            .iter()
+            .map(|e| LedgerEntry {
+                pr_number: e.pr_number,
+                result: if e.pr_number == removed_pr {
+                    LedgerEntryResult::Removed
+                } else {
+                    LedgerEntryResult::Requeued
+                },
+            })
+            .collect();
+        Self {
+            batch_id: batch.id,
+            repo_id: batch.repo_id,
+            outcome: LedgerOutcome::Superseded,
+            base_sha: batch.base_sha.clone(),
+            landed_sha: None,
+            ejected_pr: None,
+            entries,
+            started_at: batch.created_at,
+        }
+    }
 }
 
 /// A GitHub mutation; each maps 1:1 onto a `RepoClient` method.
@@ -186,6 +347,9 @@ pub enum GhCall {
         message: String,
         entry_id: Uuid,
         pr_number: u64,
+        /// The published staging ref to seed the assembly ref from when the merge
+        /// target is missing — a batch staged by the pre-assembly-ref engine.
+        seed_from: String,
     },
     FastForward {
         base_branch: String,
@@ -279,7 +443,7 @@ impl State {
             Fact::StageReset { base } => Decision {
                 effects: vec![
                     Effect::Gh(GhCall::ForceRef {
-                        staging_ref: batch.staging_ref.clone(),
+                        staging_ref: batch.assembly_ref(),
                         sha: base.clone(),
                     }),
                     Effect::Db(vec![DbWrite::SetBatchBaseSha {
@@ -302,14 +466,16 @@ impl State {
                         flow: Flow::Done(TickOutcome::Ejected { pr: *pr_number }),
                     }
                 } else {
-                    let message = format!("mq: merge #{pr_number} into {}", batch.staging_ref);
+                    let assembly_ref = batch.assembly_ref();
+                    let message = format!("mq: merge #{pr_number} into {assembly_ref}");
                     Decision {
                         effects: vec![Effect::Gh(GhCall::MergeOnto {
-                            staging_ref: batch.staging_ref.clone(),
+                            staging_ref: assembly_ref,
                             head: head_sha.clone(),
                             message,
                             entry_id: *entry_id,
                             pr_number: *pr_number,
+                            seed_from: batch.staging_ref.clone(),
                         })],
                         flow: Flow::Continue,
                     }
@@ -336,16 +502,25 @@ impl State {
                 }
             },
             Fact::StageFinalize { staging_sha } => {
-                let mut effects = vec![Effect::Db(vec![DbWrite::SetBatchStaged {
-                    batch_id: batch.id,
-                    staging_sha: staging_sha.clone(),
-                }])];
+                let mut effects = vec![
+                    Effect::Gh(GhCall::ForceRef {
+                        staging_ref: batch.staging_ref.clone(),
+                        sha: staging_sha.clone(),
+                    }),
+                    Effect::Db(vec![DbWrite::SetBatchStaged {
+                        batch_id: batch.id,
+                        staging_sha: staging_sha.clone(),
+                    }]),
+                ];
                 for e in &batch.entries {
                     effects.push(Effect::Gh(GhCall::SetLabel {
                         pr: e.pr_number,
                         target: Some(TrainLabel::Testing),
                     }));
                 }
+                effects.push(Effect::Gh(GhCall::DeleteRef {
+                    staging_ref: batch.assembly_ref(),
+                }));
                 Decision {
                     effects,
                     flow: Flow::Done(TickOutcome::Staged { batch: batch.id }),
@@ -408,9 +583,13 @@ impl State {
                         batch_id: batch.id,
                         state: BatchState::Ejected,
                     },
+                    DbWrite::AppendLedger(LedgerRecord::ejected(batch, e.pr_number)),
                 ]),
                 Effect::Gh(GhCall::DeleteRef {
                     staging_ref: batch.staging_ref.clone(),
+                }),
+                Effect::Gh(GhCall::DeleteRef {
+                    staging_ref: batch.assembly_ref(),
                 }),
                 Effect::Gh(GhCall::Comment {
                     pr: e.pr_number,
@@ -439,6 +618,7 @@ impl State {
                 batch_id: batch.id,
                 state: BatchState::Superseded,
             },
+            DbWrite::AppendLedger(LedgerRecord::superseded(batch)),
             DbWrite::CreateBatch {
                 entry_ids: first.clone(),
                 staging_ref: cfg.staging_ref(),
@@ -450,6 +630,9 @@ impl State {
         ])];
         effects.push(Effect::Gh(GhCall::DeleteRef {
             staging_ref: batch.staging_ref.clone(),
+        }));
+        effects.push(Effect::Gh(GhCall::DeleteRef {
+            staging_ref: batch.assembly_ref(),
         }));
         for pr in rest_prs {
             effects.push(Effect::Gh(GhCall::SetLabel {
@@ -464,7 +647,8 @@ impl State {
     }
 
     /// Re-queue every entry and drop the batch — base moved or the batch was
-    /// abandoned. DB state first, then the best-effort staging-ref delete.
+    /// abandoned. DB state first, then the best-effort staging- and assembly-ref
+    /// deletes (the latter cleans up a batch abandoned mid-assembly).
     fn supersede(batch: &BatchView) -> Vec<Effect> {
         let mut fx = vec![Effect::Db(vec![
             DbWrite::RequeueEntries {
@@ -474,9 +658,13 @@ impl State {
                 batch_id: batch.id,
                 state: BatchState::Superseded,
             },
+            DbWrite::AppendLedger(LedgerRecord::superseded(batch)),
         ])];
         fx.push(Effect::Gh(GhCall::DeleteRef {
             staging_ref: batch.staging_ref.clone(),
+        }));
+        fx.push(Effect::Gh(GhCall::DeleteRef {
+            staging_ref: batch.assembly_ref(),
         }));
         for e in &batch.entries {
             fx.push(Effect::Gh(GhCall::SetLabel {
@@ -513,9 +701,13 @@ impl State {
                 batch_id: batch.id,
                 state: BatchState::Superseded,
             },
+            DbWrite::AppendLedger(LedgerRecord::ejected(batch, pr_number)),
         ])];
         fx.push(Effect::Gh(GhCall::DeleteRef {
             staging_ref: batch.staging_ref.clone(),
+        }));
+        fx.push(Effect::Gh(GhCall::DeleteRef {
+            staging_ref: batch.assembly_ref(),
         }));
         fx.push(Effect::Gh(GhCall::Comment {
             pr: pr_number,
@@ -536,7 +728,10 @@ impl State {
 
     /// Land the batch: mark entries/batch Merged, then drop staging and clear the
     /// train labels. DB state first, so a resume sees Merged and never re-merges.
+    /// The assembly ref is normally already gone (deleted at finalize); the extra
+    /// best-effort delete is a harmless no-op that mops up a crash-leaked ref.
     fn finalize_merge(batch: &BatchView) -> Vec<Effect> {
+        let landed_sha = batch.staging_sha.clone().unwrap_or_default();
         let mut fx = vec![Effect::Db(vec![
             DbWrite::SetEntriesState {
                 entry_ids: batch.entry_ids(),
@@ -546,9 +741,13 @@ impl State {
                 batch_id: batch.id,
                 state: BatchState::Merged,
             },
+            DbWrite::AppendLedger(LedgerRecord::merged(batch, &landed_sha)),
         ])];
         fx.push(Effect::Gh(GhCall::DeleteRef {
             staging_ref: batch.staging_ref.clone(),
+        }));
+        fx.push(Effect::Gh(GhCall::DeleteRef {
+            staging_ref: batch.assembly_ref(),
         }));
         for pr in batch.prs() {
             fx.push(Effect::Gh(GhCall::SetLabel { pr, target: None }));
@@ -629,12 +828,14 @@ mod tests {
     ) -> BatchView {
         BatchView {
             id: Uuid::from_u128(9000),
+            repo_id: Uuid::nil(),
             state,
             base_sha: base_sha.into(),
             staging_sha: staging_sha.map(str::to_owned),
             staging_ref: "mq/staging/main".into(),
             merge_blocked: false,
             entries,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 
@@ -644,6 +845,29 @@ mod tests {
 
     fn idx(effects: &[Effect], pred: impl Fn(&Effect) -> bool) -> Option<usize> {
         effects.iter().position(pred)
+    }
+
+    /// The first `AppendLedger` record across the decision's db effect groups.
+    fn find_append_ledger(d: &Decision) -> Option<LedgerRecord> {
+        d.effects.iter().find_map(|e| match e {
+            Effect::Db(writes) => writes.iter().find_map(|w| {
+                if let DbWrite::AppendLedger(rec) = w {
+                    Some(rec.clone())
+                } else {
+                    None
+                }
+            }),
+            Effect::Gh(_) => None,
+        })
+    }
+
+    /// The recorded result for one PR in a ledger record.
+    fn entry_result(rec: &LedgerRecord, pr: u64) -> LedgerEntryResult {
+        rec.entries
+            .iter()
+            .find(|e| e.pr_number == pr)
+            .map(|e| e.result)
+            .expect("entry present in record")
     }
 
     #[test]
@@ -701,7 +925,7 @@ mod tests {
             d.effects,
             vec![
                 Effect::Gh(GhCall::ForceRef {
-                    staging_ref: "mq/staging/main".into(),
+                    staging_ref: "mq-tmp/staging/main".into(),
                     sha: "base9".into()
                 }),
                 Effect::Db(vec![DbWrite::SetBatchBaseSha {
@@ -726,11 +950,12 @@ mod tests {
         assert_eq!(
             d.effects,
             vec![Effect::Gh(GhCall::MergeOnto {
-                staging_ref: "mq/staging/main".into(),
+                staging_ref: "mq-tmp/staging/main".into(),
                 head: "h7".into(),
-                message: "mq: merge #7 into mq/staging/main".into(),
+                message: "mq: merge #7 into mq-tmp/staging/main".into(),
                 entry_id: Uuid::from_u128(7),
                 pr_number: 7,
+                seed_from: "mq/staging/main".into(),
             })]
         );
     }
@@ -815,6 +1040,14 @@ mod tests {
         );
         assert_eq!(
             d.effects[0],
+            Effect::Gh(GhCall::ForceRef {
+                staging_ref: "mq/staging/main".into(),
+                sha: "stg".into()
+            }),
+            "the real staging ref is flipped to the assembled tip first"
+        );
+        assert_eq!(
+            d.effects[1],
             Effect::Db(vec![DbWrite::SetBatchStaged {
                 batch_id: Uuid::from_u128(9000),
                 staging_sha: "stg".into()
@@ -828,6 +1061,26 @@ mod tests {
             pr: 8,
             target: Some(TrainLabel::Testing)
         })));
+        assert_eq!(
+            d.effects.last(),
+            Some(&Effect::Gh(GhCall::DeleteRef {
+                staging_ref: "mq-tmp/staging/main".into()
+            })),
+            "the assembly ref is dropped last, after the batch is persisted staged"
+        );
+        let force = idx(&d.effects, |e| {
+            matches!(e, Effect::Gh(GhCall::ForceRef { .. }))
+        })
+        .unwrap();
+        let db = idx(&d.effects, |e| matches!(e, Effect::Db(_))).unwrap();
+        let del = idx(&d.effects, |e| {
+            matches!(e, Effect::Gh(GhCall::DeleteRef { .. }))
+        })
+        .unwrap();
+        assert!(
+            force < db && db < del,
+            "crash-safety: flip staging before persisting, delete assembly last"
+        );
     }
 
     #[test]
@@ -1125,5 +1378,98 @@ mod tests {
             ),
             Some(vec!["ci".into()])
         );
+    }
+
+    #[test]
+    fn test_state_ledger_merged_appends_landed_record() {
+        let b = batch(
+            BatchState::Merging,
+            "base9",
+            Some("stg"),
+            vec![entry(7, true), entry(8, true)],
+        );
+        let d = State::decide(
+            &cfg(),
+            &active(
+                b,
+                Fact::MergeBase {
+                    current: "stg".into(),
+                },
+            ),
+        );
+        let rec = find_append_ledger(&d).expect("ledger emitted");
+        assert_eq!(rec.outcome, LedgerOutcome::Merged);
+        assert_eq!(rec.landed_sha.as_deref(), Some("stg"));
+        assert!(
+            rec.entries
+                .iter()
+                .all(|e| e.result == LedgerEntryResult::Landed)
+        );
+    }
+
+    #[test]
+    fn test_state_ledger_ejected_records_culprit() {
+        let b = batch(
+            BatchState::Bisecting,
+            "base9",
+            Some("stg"),
+            vec![entry(440, true)],
+        );
+        let d = State::decide(&cfg(), &active(b, Fact::Bisect));
+        let rec = find_append_ledger(&d).expect("ledger emitted");
+        assert_eq!(rec.outcome, LedgerOutcome::Ejected);
+        assert_eq!(rec.ejected_pr, Some(440));
+        assert_eq!(entry_result(&rec, 440), LedgerEntryResult::Ejected);
+    }
+
+    #[test]
+    fn test_state_ledger_superseded_requeues_all() {
+        let b = batch(
+            BatchState::Testing,
+            "base9",
+            Some("stg"),
+            vec![entry(7, true), entry(8, true)],
+        );
+        let d = State::decide(&cfg(), &active(b, Fact::BaseMoved));
+        let rec = find_append_ledger(&d).expect("ledger emitted");
+        assert_eq!(rec.outcome, LedgerOutcome::Superseded);
+        assert!(
+            rec.entries
+                .iter()
+                .all(|e| e.result == LedgerEntryResult::Requeued)
+        );
+    }
+
+    #[test]
+    fn test_state_ledger_bisect_split_records_superseded() {
+        let b = batch(
+            BatchState::Bisecting,
+            "base9",
+            Some("stg"),
+            vec![entry(440, true), entry(441, true)],
+        );
+        let d = State::decide(&cfg(), &active(b, Fact::Bisect));
+        let rec = find_append_ledger(&d).expect("the split records the original batch");
+        assert_eq!(rec.outcome, LedgerOutcome::Superseded);
+        assert_eq!(rec.ejected_pr, None);
+        assert!(
+            rec.entries
+                .iter()
+                .all(|e| e.result == LedgerEntryResult::Requeued)
+        );
+    }
+
+    #[test]
+    fn test_state_ledger_removed_marks_pulled_pr() {
+        let view = batch(
+            BatchState::Testing,
+            "base9",
+            Some("stg"),
+            vec![entry(440, true), entry(441, true)],
+        );
+        let rec = LedgerRecord::removed(&view, 440);
+        assert_eq!(rec.outcome, LedgerOutcome::Superseded);
+        assert_eq!(entry_result(&rec, 440), LedgerEntryResult::Removed);
+        assert_eq!(entry_result(&rec, 441), LedgerEntryResult::Requeued);
     }
 }

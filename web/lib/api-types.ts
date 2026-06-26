@@ -36,6 +36,50 @@ export interface Health {
 	status: string;
 }
 
+/** What happened to one PR in a finished batch run, snapshotted into the ledger. */
+export enum LedgerEntryResult {
+	/** The PR landed on the base branch with its batch. */
+	Landed = "landed",
+	/** The PR was identified as the batch breaker and removed from the queue. */
+	Ejected = "ejected",
+	/** The PR went back to the queue to be retried in a later batch. */
+	Requeued = "requeued",
+	/**
+	 * The PR was manually pulled from its in-flight batch (dashboard remove or
+	 * a PR-close webhook) — it left the queue rather than going back to it.
+	 */
+	Removed = "removed",
+}
+
+/** One PR's fate within a finished batch run, projected from the ledger. */
+export interface LedgerEntryView {
+	prNumber: number;
+	result: LedgerEntryResult;
+}
+
+/** Terminal outcome recorded in the append-only `queue_ledger` table. */
+export enum LedgerOutcome {
+	/** All PRs in the batch landed on the base branch. */
+	Merged = "merged",
+	/** A culprit PR was ejected; the remainder was re-queued. */
+	Ejected = "ejected",
+	/** The batch was abandoned because the base moved or it was overtaken. */
+	Superseded = "superseded",
+}
+
+/** One finished batch run from the append-only ledger (the dashboard's history view). */
+export interface LedgerView {
+	id: string;
+	batchId: string;
+	outcome: LedgerOutcome;
+	baseSha: string;
+	landedSha?: string;
+	ejectedPr?: number;
+	entries: LedgerEntryView[];
+	startedAt: string;
+	endedAt: string;
+}
+
 /** The signed-in GitHub user, for the dashboard's auth gate. */
 export interface MeView {
 	login: string;

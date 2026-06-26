@@ -7,11 +7,12 @@ mod state;
 
 pub use engine::Engine;
 pub use model::{
-    Batch, BatchState, EntryState, MergeMethod, QueueEntry, RepoQueueConfig, TickOutcome,
+    Batch, BatchState, EntryState, LedgerOutcome, MergeMethod, QueueEntry, RepoQueueConfig,
+    TickOutcome,
 };
 pub use state::{
-    BatchView, DbWrite, Decision, Effect, EntryView, Fact, Flow, GhCall, MergeReport, Observation,
-    State,
+    BatchView, DbWrite, Decision, Effect, EntryView, Fact, Flow, GhCall, LedgerEntry,
+    LedgerEntryResult, LedgerRecord, MergeReport, Observation, State,
 };
 
 #[derive(Debug, thiserror::Error)]
