@@ -12,19 +12,32 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE batches ADD COLUMN merge_blocked BOOLEAN NOT NULL DEFAULT false;",
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("batches"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("merge_blocked"))
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
             )
             .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared("ALTER TABLE batches DROP COLUMN IF EXISTS merge_blocked;")
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("batches"))
+                    .drop_column(Alias::new("merge_blocked"))
+                    .to_owned(),
+            )
             .await?;
+
         Ok(())
     }
 }

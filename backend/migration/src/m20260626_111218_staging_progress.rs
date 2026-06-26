@@ -11,19 +11,32 @@ pub struct Migration;
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE batch_entries ADD COLUMN staged BOOLEAN NOT NULL DEFAULT false;",
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("batch_entries"))
+                    .add_column(
+                        ColumnDef::new(Alias::new("staged"))
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
             )
             .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared("ALTER TABLE batch_entries DROP COLUMN IF EXISTS staged;")
+            .alter_table(
+                Table::alter()
+                    .table(Alias::new("batch_entries"))
+                    .drop_column(Alias::new("staged"))
+                    .to_owned(),
+            )
             .await?;
+
         Ok(())
     }
 }

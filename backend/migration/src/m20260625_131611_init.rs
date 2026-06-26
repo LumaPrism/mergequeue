@@ -1,7 +1,10 @@
-//! Initial schema. Raw SQL for readability; SeaORM entities are generated from
-//! this. One installation has many repos; each repo has a queue (entries) and at
-//! most one non-terminal batch.
+//! Initial schema. One installation has many repos; each repo has a queue
+//! (entries) and at most one non-terminal batch. `queue_entries_repo_pr_open`
+//! and `batches_one_active` are partial unique indexes; sea-query 0.32 renders
+//! the Postgres partial-index `WHERE` via `cond_where`, so they stay in the
+//! builder rather than raw SQL.
 
+use sea_orm_migration::prelude::extension::postgres::Type;
 use sea_orm_migration::prelude::*;
 
 #[derive(DeriveMigrationName)]
@@ -10,85 +13,367 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = r#"
-        CREATE TYPE entry_state  AS ENUM ('queued', 'testing', 'merged', 'ejected');
-        CREATE TYPE batch_state  AS ENUM ('staging', 'testing', 'merging', 'bisecting', 'merged', 'ejected', 'superseded');
-        CREATE TYPE merge_method AS ENUM ('squash', 'merge', 'rebase');
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(Alias::new("entry_state"))
+                    .values([
+                        Alias::new("queued"),
+                        Alias::new("testing"),
+                        Alias::new("merged"),
+                        Alias::new("ejected"),
+                    ])
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(Alias::new("batch_state"))
+                    .values([
+                        Alias::new("staging"),
+                        Alias::new("testing"),
+                        Alias::new("merging"),
+                        Alias::new("bisecting"),
+                        Alias::new("merged"),
+                        Alias::new("ejected"),
+                        Alias::new("superseded"),
+                    ])
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_type(
+                Type::create()
+                    .as_enum(Alias::new("merge_method"))
+                    .values([
+                        Alias::new("squash"),
+                        Alias::new("merge"),
+                        Alias::new("rebase"),
+                    ])
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE installations (
-            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            installation_id BIGINT NOT NULL UNIQUE,
-            account_login   TEXT   NOT NULL,
-            status          TEXT   NOT NULL DEFAULT 'active',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("installations"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("installation_id"))
+                            .big_integer()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("account_login"))
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("status"))
+                            .text()
+                            .not_null()
+                            .default("active"),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE repos (
-            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            installation_pk UUID NOT NULL REFERENCES installations(id) ON DELETE CASCADE,
-            owner           TEXT NOT NULL,
-            name            TEXT NOT NULL,
-            base_branch     TEXT NOT NULL DEFAULT 'main',
-            batch_size      INT  NOT NULL DEFAULT 1,
-            merge_method    merge_method NOT NULL DEFAULT 'squash',
-            staging_prefix  TEXT NOT NULL DEFAULT 'mq/staging',
-            required_checks JSONB NOT NULL DEFAULT '[]',
-            created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-            UNIQUE (owner, name)
-        );
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("repos"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("installation_pk"))
+                            .uuid()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alias::new("owner")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("name")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("base_branch"))
+                            .text()
+                            .not_null()
+                            .default("main"),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("batch_size"))
+                            .integer()
+                            .not_null()
+                            .default(1),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("merge_method"))
+                            .custom(Alias::new("merge_method"))
+                            .not_null()
+                            .default("squash"),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("staging_prefix"))
+                            .text()
+                            .not_null()
+                            .default("mq/staging"),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("required_checks"))
+                            .json_binary()
+                            .not_null()
+                            .default(Expr::cust("'[]'::jsonb")),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("repos"), Alias::new("installation_pk"))
+                            .to(Alias::new("installations"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .index(
+                        Index::create()
+                            .col(Alias::new("owner"))
+                            .col(Alias::new("name"))
+                            .unique(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE queue_entries (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            repo_id     UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-            pr_number   BIGINT NOT NULL,
-            position    INT NOT NULL,
-            state       entry_state NOT NULL DEFAULT 'queued',
-            enqueued_by TEXT NOT NULL,
-            enqueued_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            head_sha    TEXT NOT NULL
-        );
-        CREATE INDEX queue_entries_repo_pos ON queue_entries (repo_id, position);
-        CREATE UNIQUE INDEX queue_entries_repo_pr_open
-            ON queue_entries (repo_id, pr_number)
-            WHERE state IN ('queued', 'testing');
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("queue_entries"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("repo_id")).uuid().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("pr_number"))
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alias::new("position")).integer().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("state"))
+                            .custom(Alias::new("entry_state"))
+                            .not_null()
+                            .default("queued"),
+                    )
+                    .col(ColumnDef::new(Alias::new("enqueued_by")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("enqueued_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .col(ColumnDef::new(Alias::new("head_sha")).text().not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("queue_entries"), Alias::new("repo_id"))
+                            .to(Alias::new("repos"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("queue_entries_repo_pos")
+                    .table(Alias::new("queue_entries"))
+                    .col(Alias::new("repo_id"))
+                    .col(Alias::new("position"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("queue_entries_repo_pr_open")
+                    .table(Alias::new("queue_entries"))
+                    .col(Alias::new("repo_id"))
+                    .col(Alias::new("pr_number"))
+                    .unique()
+                    .cond_where(Expr::cust("state IN ('queued', 'testing')"))
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE batches (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            repo_id     UUID NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-            base_sha    TEXT NOT NULL,
-            staging_sha TEXT,
-            staging_ref TEXT NOT NULL,
-            state       batch_state NOT NULL DEFAULT 'staging',
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        -- at most one non-terminal batch per repo (FSM invariant)
-        CREATE UNIQUE INDEX batches_one_active
-            ON batches (repo_id)
-            WHERE state IN ('staging', 'testing', 'merging', 'bisecting');
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("batches"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("repo_id")).uuid().not_null())
+                    .col(ColumnDef::new(Alias::new("base_sha")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("staging_sha")).text().null())
+                    .col(ColumnDef::new(Alias::new("staging_ref")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("state"))
+                            .custom(Alias::new("batch_state"))
+                            .not_null()
+                            .default("staging"),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("batches"), Alias::new("repo_id"))
+                            .to(Alias::new("repos"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("batches_one_active")
+                    .table(Alias::new("batches"))
+                    .col(Alias::new("repo_id"))
+                    .unique()
+                    .cond_where(Expr::cust(
+                        "state IN ('staging', 'testing', 'merging', 'bisecting')",
+                    ))
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE batch_entries (
-            batch_id UUID NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
-            entry_id UUID NOT NULL REFERENCES queue_entries(id) ON DELETE CASCADE,
-            ord      INT  NOT NULL,
-            PRIMARY KEY (batch_id, entry_id)
-        );
-        "#;
-        manager.get_connection().execute_unprepared(sql).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("batch_entries"))
+                    .col(ColumnDef::new(Alias::new("batch_id")).uuid().not_null())
+                    .col(ColumnDef::new(Alias::new("entry_id")).uuid().not_null())
+                    .col(ColumnDef::new(Alias::new("ord")).integer().not_null())
+                    .primary_key(
+                        Index::create()
+                            .col(Alias::new("batch_id"))
+                            .col(Alias::new("entry_id")),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("batch_entries"), Alias::new("batch_id"))
+                            .to(Alias::new("batches"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("batch_entries"), Alias::new("entry_id"))
+                            .to(Alias::new("queue_entries"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = r#"
-        DROP TABLE IF EXISTS batch_entries;
-        DROP TABLE IF EXISTS batches;
-        DROP TABLE IF EXISTS queue_entries;
-        DROP TABLE IF EXISTS repos;
-        DROP TABLE IF EXISTS installations;
-        DROP TYPE IF EXISTS merge_method;
-        DROP TYPE IF EXISTS batch_state;
-        DROP TYPE IF EXISTS entry_state;
-        "#;
-        manager.get_connection().execute_unprepared(sql).await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("batch_entries"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("batches"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("queue_entries"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("repos"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("installations"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_type(
+                Type::drop()
+                    .if_exists()
+                    .name(Alias::new("merge_method"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_type(
+                Type::drop()
+                    .if_exists()
+                    .name(Alias::new("batch_state"))
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_type(
+                Type::drop()
+                    .if_exists()
+                    .name(Alias::new("entry_state"))
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 }

@@ -11,28 +11,59 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = r#"
-        CREATE TABLE github_app (
-            id             INT  PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-            app_id         BIGINT NOT NULL,
-            slug           TEXT NOT NULL,
-            client_id      TEXT NOT NULL,
-            client_secret  TEXT NOT NULL,
-            private_key    TEXT NOT NULL,
-            webhook_secret TEXT NOT NULL,
-            html_url       TEXT,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        "#;
-        manager.get_connection().execute_unprepared(sql).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("github_app"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .integer()
+                            .default(1)
+                            .primary_key()
+                            .check(Expr::cust("id = 1")),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("app_id"))
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alias::new("slug")).text().not_null())
+                    .col(ColumnDef::new(Alias::new("client_id")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("client_secret"))
+                            .text()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alias::new("private_key")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("webhook_secret"))
+                            .text()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Alias::new("html_url")).text().null())
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared("DROP TABLE IF EXISTS github_app;")
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("github_app"))
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
+
         Ok(())
     }
 }

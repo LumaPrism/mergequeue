@@ -10,33 +10,103 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = r#"
-        CREATE TABLE users (
-            id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            github_id  BIGINT NOT NULL UNIQUE,
-            login      TEXT   NOT NULL,
-            avatar_url TEXT   NOT NULL DEFAULT '',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("users"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("github_id"))
+                            .big_integer()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("login")).text().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("avatar_url"))
+                            .text()
+                            .not_null()
+                            .default(""),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .to_owned(),
+            )
+            .await?;
 
-        CREATE TABLE sessions (
-            id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            user_pk    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            expires_at TIMESTAMPTZ NOT NULL
-        );
-        CREATE INDEX sessions_user ON sessions (user_pk);
-        "#;
-        manager.get_connection().execute_unprepared(sql).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Alias::new("sessions"))
+                    .col(
+                        ColumnDef::new(Alias::new("id"))
+                            .uuid()
+                            .not_null()
+                            .default(Expr::cust("gen_random_uuid()"))
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("user_pk")).uuid().not_null())
+                    .col(
+                        ColumnDef::new(Alias::new("created_at"))
+                            .timestamp_with_time_zone()
+                            .not_null()
+                            .default(Expr::cust("now()")),
+                    )
+                    .col(
+                        ColumnDef::new(Alias::new("expires_at"))
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .from(Alias::new("sessions"), Alias::new("user_pk"))
+                            .to(Alias::new("users"), Alias::new("id"))
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("sessions_user")
+                    .table(Alias::new("sessions"))
+                    .col(Alias::new("user_pk"))
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let sql = r#"
-        DROP TABLE IF EXISTS sessions;
-        DROP TABLE IF EXISTS users;
-        "#;
-        manager.get_connection().execute_unprepared(sql).await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("sessions"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("users"))
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await?;
+
         Ok(())
     }
 }
