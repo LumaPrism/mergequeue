@@ -83,6 +83,7 @@
   --st-merge: var(--sig-green);
   --st-eject: var(--sig-red);
   --st-superseded: var(--sig-slate);
+  --st-blocked: var(--sig-amber);
 
   /* state inks (tag/label TEXT) */
   --st-queued-ink: var(--sig-grey-ink);
@@ -91,6 +92,7 @@
   --st-merge-ink: var(--sig-green-ink);
   --st-eject-ink: var(--sig-red-ink);
   --st-superseded-ink: var(--sig-slate-ink);
+  --st-blocked-ink: var(--sig-amber-ink);
 
   /* one state-chip tint recipe */
   --tint-bg-pct: 12%;

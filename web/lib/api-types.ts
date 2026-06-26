@@ -15,15 +15,13 @@ export interface EnqueueRequest {
 	prNumber: number;
 }
 
-/** Lifecycle of a single queued PR. */
-export enum EntryState {
-	/** Waiting in line. */
+/** A PR's place in the merge lifecycle — projected from its entry + batch. */
+export enum PrStatus {
 	Queued = "queued",
-	/** Part of the batch currently being staged/tested. */
 	Testing = "testing",
-	/** Landed on the base branch. */
+	Merging = "merging",
+	Blocked = "blocked",
 	Merged = "merged",
-	/** Removed from the queue after being identified as the batch breaker. */
 	Ejected = "ejected",
 }
 
@@ -31,7 +29,7 @@ export interface EntryView {
 	id: string;
 	prNumber: number;
 	position: number;
-	state: EntryState;
+	status: PrStatus;
 }
 
 export interface Health {
@@ -119,6 +117,18 @@ export enum BatchState {
 	Ejected = "ejected",
 	/** Terminal: base moved or the batch was abandoned; entries re-queued. */
 	Superseded = "superseded",
+}
+
+/** Lifecycle of a single queued PR. */
+export enum EntryState {
+	/** Waiting in line. */
+	Queued = "queued",
+	/** Part of the batch currently being staged/tested. */
+	Testing = "testing",
+	/** Landed on the base branch. */
+	Merged = "merged",
+	/** Removed from the queue after being identified as the batch breaker. */
+	Ejected = "ejected",
 }
 
 export enum MergeMethod {

@@ -4,7 +4,7 @@
 
 import type { CSSProperties } from "react";
 
-import { BatchState, EntryState } from "./api-types";
+import { BatchState, EntryState, PrStatus } from "./api-types";
 
 export type AnyState = EntryState | BatchState;
 export type CheckState = "pass" | "running" | "fail";
@@ -35,6 +35,25 @@ export const stateInk: Record<AnyState, string> = {
   [BatchState.Bisecting]: "var(--st-eject-ink)",
   [EntryState.Ejected]: "var(--st-eject-ink)",
   [BatchState.Superseded]: "var(--st-superseded-ink)",
+};
+
+/** The dashboard's per-PR display status → token (exhaustive over PrStatus). */
+export const statusColor: Record<PrStatus, string> = {
+  [PrStatus.Queued]: "var(--st-queued)",
+  [PrStatus.Testing]: "var(--st-testing)",
+  [PrStatus.Merging]: "var(--st-merge)",
+  [PrStatus.Blocked]: "var(--st-blocked)",
+  [PrStatus.Merged]: "var(--st-merge)",
+  [PrStatus.Ejected]: "var(--st-eject)",
+};
+
+export const statusInk: Record<PrStatus, string> = {
+  [PrStatus.Queued]: "var(--st-queued-ink)",
+  [PrStatus.Testing]: "var(--st-testing-ink)",
+  [PrStatus.Merging]: "var(--st-merge-ink)",
+  [PrStatus.Blocked]: "var(--st-blocked-ink)",
+  [PrStatus.Merged]: "var(--st-merge-ink)",
+  [PrStatus.Ejected]: "var(--st-eject-ink)",
 };
 
 export const checkColor: Record<CheckState, string> = {

@@ -18,7 +18,7 @@ use crate::auth::current_user;
 use crate::config::Config;
 use crate::error::Error as AppError;
 use crate::github::PullSummary;
-use crate::queue::{EntryState, QueueEntry};
+use crate::queue::{BatchState, BatchView, EntryState, QueueEntry};
 use crate::runtime::{AppOwner, Enqueued, Removed, Runtime};
 use crate::setup::resolve_credentials;
 use crate::store::{RepoSummary, Store};
@@ -45,16 +45,45 @@ pub struct EntryView {
     pub id: String,
     pub pr_number: u32,
     pub position: i32,
-    pub state: EntryState,
+    pub status: PrStatus,
 }
 
-impl From<QueueEntry> for EntryView {
-    fn from(e: QueueEntry) -> Self {
+/// A PR's place in the merge lifecycle — projected from its entry + batch.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Enum)]
+#[serde(rename_all = "lowercase")]
+#[oai(rename_all = "lowercase")]
+pub enum PrStatus {
+    Queued,
+    Testing,
+    Merging,
+    Blocked,
+    Merged,
+    Ejected,
+}
+
+impl PrStatus {
+    fn of(state: EntryState, batch: Option<&BatchView>) -> Self {
+        match state {
+            EntryState::Queued => Self::Queued,
+            EntryState::Merged => Self::Merged,
+            EntryState::Ejected => Self::Ejected,
+            EntryState::Testing => match batch {
+                Some(b) if b.merge_blocked => Self::Blocked,
+                Some(b) if b.state == BatchState::Merging => Self::Merging,
+                _ => Self::Testing,
+            },
+        }
+    }
+}
+
+impl EntryView {
+    fn project(e: QueueEntry, batch: Option<&BatchView>) -> Self {
         Self {
+            status: PrStatus::of(e.state, batch),
             id: e.id.to_string(),
             pr_number: e.pr_number as u32,
             position: e.position,
-            state: e.state,
         }
     }
 }
@@ -326,7 +355,14 @@ impl Api {
         let entries = Store::list_entries(&self.db, repo_id)
             .await
             .map_err(Self::db_err)?;
-        Ok(Json(entries.into_iter().map(EntryView::from).collect()))
+        let batch = Store::active_batch_view(&self.db, repo_id)
+            .await
+            .map_err(Self::db_err)?;
+        let views = entries
+            .into_iter()
+            .map(|e| EntryView::project(e, batch.as_ref()))
+            .collect();
+        Ok(Json(views))
     }
 
     /// Add a PR to the queue. Validates the PR's base matches the queue before
@@ -346,7 +382,12 @@ impl Api {
             .await
             .map_err(Self::enqueue_err)?
         {
-            Enqueued::Ok { entry, .. } => Ok(Json(EntryView::from(entry))),
+            Enqueued::Ok { entry, .. } => {
+                let batch = Store::active_batch_view(&self.db, repo_id)
+                    .await
+                    .map_err(Self::db_err)?;
+                Ok(Json(EntryView::project(entry, batch.as_ref())))
+            }
             Enqueued::WrongBase {
                 pr_base,
                 queue_base,
@@ -415,7 +456,14 @@ impl Api {
         let entries = Store::list_entries(&self.db, repo_id)
             .await
             .map_err(Self::db_err)?;
-        Ok(Json(entries.into_iter().map(EntryView::from).collect()))
+        let batch = Store::active_batch_view(&self.db, repo_id)
+            .await
+            .map_err(Self::db_err)?;
+        let views = entries
+            .into_iter()
+            .map(|e| EntryView::project(e, batch.as_ref()))
+            .collect();
+        Ok(Json(views))
     }
 
     // TODO:

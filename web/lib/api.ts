@@ -20,7 +20,7 @@ export type {
   RepoView,
   SetupStatus,
 } from "./api-types";
-export { EntryState, BatchState, MergeMethod, SetupSource } from "./api-types";
+export { EntryState, BatchState, MergeMethod, PrStatus, SetupSource } from "./api-types";
 
 // Server components fetch the backend directly (absolute); client-side calls use
 // the same-origin "/api" rewrite (see next.config.mjs).

@@ -32,8 +32,7 @@ import { CSS } from "@dnd-kit/utilities";
 
 import { SetupGate } from "@/components/SetupGate";
 import {
-  BatchState,
-  EntryState,
+  PrStatus,
   dequeue,
   enqueue,
   getMe,
@@ -43,8 +42,7 @@ import {
   reorder,
 } from "@/lib/api";
 import type { EntryView, MeView, PrView, RepoView } from "@/lib/api";
-import type { AnyState } from "@/lib/state";
-import { stateColor, stateInk, svar } from "@/lib/state";
+import { stateColor, statusColor, statusInk, svar } from "@/lib/state";
 
 const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
 
@@ -102,8 +100,8 @@ function LoginScreen() {
 
 /// The signal-box's signature primitive: a state tag that *flips* (never fades)
 /// when its value changes. Tabular board voice so columns lock.
-function FlipTag({ value, className = "tag" }: { value: AnyState; className?: string }) {
-  const [shown, setShown] = useState<AnyState>(value);
+function FlipTag({ value, className = "tag" }: { value: PrStatus; className?: string }) {
+  const [shown, setShown] = useState<PrStatus>(value);
   const [flipping, setFlipping] = useState(false);
 
   useEffect(() => {
@@ -120,7 +118,7 @@ function FlipTag({ value, className = "tag" }: { value: AnyState; className?: st
   return (
     <span
       className={`${className} flip ${flipping ? "flipping" : ""}`}
-      style={svar(stateColor[shown], stateInk[shown])}
+      style={svar(statusColor[shown], statusInk[shown])}
     >
       <span className="flip-face">{shown}</span>
     </span>
@@ -249,7 +247,7 @@ function CarBody({ entry, pr, href }: { entry: EntryView; pr?: PrView; href: str
   const title = pr?.title ?? `PR #${entry.prNumber}`;
   return (
     <>
-      <span className="knob" style={svar(stateColor[entry.state])} />
+      <span className="knob" style={svar(statusColor[entry.status])} />
       <span className="num">
         <a
           className="prlink"
@@ -270,7 +268,7 @@ function CarBody({ entry, pr, href }: { entry: EntryView; pr?: PrView; href: str
           </div>
         ) : null}
       </div>
-      <FlipTag value={entry.state} />
+      <FlipTag value={entry.status} />
     </>
   );
 }
@@ -299,7 +297,7 @@ function Car({
     transform: CSS.Transform.toString(transform),
     transition,
     ["--i"]: index,
-    ...svar(stateColor[entry.state]),
+    ...svar(statusColor[entry.status]),
   } as CSSProperties;
   return (
     <div
@@ -643,42 +641,50 @@ export default function Dashboard() {
   const prsLoading = !minOver || !reposLoaded || !prsReady;
   const queuedNums = new Set(queue.map((e) => e.prNumber));
   const prByNum = new Map(prs.map((p) => [p.number, p] as const));
-  const pinned = queue.filter((e) => e.state !== EntryState.Queued);
-  const cars = queue.filter((e) => e.state === EntryState.Queued);
+  const pinned = queue.filter((e) => e.status !== PrStatus.Queued);
+  const cars = queue.filter((e) => e.status === PrStatus.Queued);
   const batchSize = repo?.batchSize ?? 0;
   const filter = prFilter.trim().toLowerCase();
   const shownPrs = filter
     ? prs.filter((p) => `#${p.number} ${p.title} ${p.headRef}`.toLowerCase().includes(filter))
     : prs;
 
-  const railState = pinned.some((e) => e.state === EntryState.Ejected)
+  const atMerge = (e: EntryView) =>
+    e.status === PrStatus.Merged ||
+    e.status === PrStatus.Merging ||
+    e.status === PrStatus.Blocked;
+
+  const railState = pinned.some((e) => e.status === PrStatus.Ejected)
     ? "ejecting"
-    : pinned.some((e) => e.state === EntryState.Merged)
+    : pinned.some(atMerge)
       ? "merging"
-      : pinned.some((e) => e.state === EntryState.Testing)
+      : pinned.some((e) => e.status === PrStatus.Testing)
         ? "testing"
         : "idle";
 
   const batchStage: "testing" | "merging" | "merged" | "ejected" | null =
     pinned.length === 0
       ? null
-      : pinned.some((e) => e.state === EntryState.Ejected)
+      : pinned.some((e) => e.status === PrStatus.Ejected)
         ? "ejected"
-        : pinned.every((e) => e.state === EntryState.Merged)
+        : pinned.every((e) => e.status === PrStatus.Merged)
           ? "merged"
-          : pinned.some((e) => e.state === EntryState.Merged)
+          : pinned.some(atMerge)
             ? "merging"
             : "testing";
 
-  const batchHeadState: AnyState | null =
-    batchStage === "testing"
-      ? EntryState.Testing
+  const batchHeadState: PrStatus | null = pinned.some(
+    (e) => e.status === PrStatus.Blocked,
+  )
+    ? PrStatus.Blocked
+    : batchStage === "testing"
+      ? PrStatus.Testing
       : batchStage === "merging"
-        ? BatchState.Merging
+        ? PrStatus.Merging
         : batchStage === "merged"
-          ? EntryState.Merged
+          ? PrStatus.Merged
           : batchStage === "ejected"
-            ? EntryState.Ejected
+            ? PrStatus.Ejected
             : null;
 
   const ghUrl = (n: number) =>
@@ -692,7 +698,7 @@ export default function Dashboard() {
     setQueue((q) =>
       q.some((e) => e.prNumber === pr.number)
         ? q
-        : [...q, { id: tempId, prNumber: pr.number, position: q.length, state: EntryState.Queued }],
+        : [...q, { id: tempId, prNumber: pr.number, position: q.length, status: PrStatus.Queued }],
     );
     try {
       await enqueue(sel, pr.number);
@@ -914,18 +920,20 @@ export default function Dashboard() {
                         {pinned.map((e, i) => (
                           <div
                             className={`node pr car pinned ${
-                              e.state === EntryState.Merged ? "is-merged" : ""
-                            } ${e.state === EntryState.Ejected ? "is-ejected" : ""}`}
+                              e.status === PrStatus.Merged ? "is-merged" : ""
+                            } ${e.status === PrStatus.Ejected ? "is-ejected" : ""}`}
                             key={e.id}
-                            style={{ ...svar(stateColor[e.state]), ["--i"]: i } as CSSProperties}
+                            style={{ ...svar(statusColor[e.status]), ["--i"]: i } as CSSProperties}
                           >
                             <CarBody entry={e} pr={prByNum.get(e.prNumber)} href={ghUrl(e.prNumber)} />
-                            {e.state === EntryState.Testing && (
+                            {(e.status === PrStatus.Testing ||
+                              e.status === PrStatus.Merging ||
+                              e.status === PrStatus.Blocked) && (
                               <button
                                 type="button"
                                 className="car-x"
                                 aria-label={`remove #${e.prNumber}`}
-                                title="Remove — cancels the current test batch"
+                                title="Remove — cancels the current batch"
                                 onClick={() => doRemove(e)}
                               >
                                 ×
@@ -1035,7 +1043,7 @@ export default function Dashboard() {
                             <span className="ttl">
                               {prByNum.get(e.prNumber)?.title ?? `PR #${e.prNumber}`}
                             </span>
-                            <FlipTag value={e.state} className="tag mini" />
+                            <FlipTag value={e.status} className="tag mini" />
                           </div>
                         ))}
                       </div>
