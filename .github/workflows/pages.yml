@@ -1,10 +1,5 @@
 name: Deploy landing page
 
-# The repo's web/ app is a full Next.js app (dashboard + docs + API routes) that
-# needs the backend. GitHub Pages only serves static files, so this builds a
-# landing-only static export: it strips the dashboard/docs/api routes, then
-# `next build` with PAGES_EXPORT=1 (output: export, basePath /mergequeue).
-
 on:
   push:
     branches: [main]

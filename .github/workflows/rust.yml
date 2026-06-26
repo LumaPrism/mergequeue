@@ -49,7 +49,4 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        # Serial: the engine tests share one mergequeue_test database and TRUNCATE
-        # between cases, so they must not run concurrently (belt-and-suspenders to
-        # the in-process DB_LOCK).
         run: cargo test --all -- --test-threads=1

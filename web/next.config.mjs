@@ -1,8 +1,5 @@
 import { createMDX } from "fumadocs-mdx/next";
 
-// PAGES_EXPORT builds a static, landing-only site for GitHub Pages (served under
-// /mergequeue). The CI workflow strips the dashboard/docs/api routes first, so the
-// export contains just the marketing landing — rewrites (a server feature) are off.
 const isExport = process.env.PAGES_EXPORT === "1";
 
 /** @type {import('next').NextConfig} */

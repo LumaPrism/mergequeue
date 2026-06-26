@@ -1,7 +1,5 @@
 name: release
 
-# Build and publish the backend image to GHCR on a version tag (v1.2.3) — then
-# `docker run --env-file .env ghcr.io/lumaprism/mergequeue` runs that release.
 on:
   push:
     tags:
