@@ -122,19 +122,19 @@ export function DepartureBoard() {
   const p = SCRIPT[phase];
 
   return (
-    <div className="lp-board" data-rail={p.rail} aria-hidden ref={ref}>
+    <div className="lp-board" aria-hidden ref={ref}>
       <div className="lp-board-head">
         <span className="lp-board-title">departures</span>
         <FlipText value={p.status} className="lp-board-status" />
       </div>
 
-      <div className="lp-board-track">
-        <span className="board-rail">
-          <span className="board-surge" />
-        </span>
+      <div className="stack" data-rail={p.rail}>
+        <div className="rail">
+          <span className="surge" />
+        </div>
 
         <div className="board-main">
-          <span className="board-knob is-main" style={svar(stateColor[M])} />
+          <span className="knob full" style={svar(stateColor[M])} />
           <span className="board-main-ref">main</span>
           <FlipText value={p.sha} className="board-main-sha" />
           <span className="board-main-lamp">always green</span>
@@ -151,7 +151,7 @@ export function DepartureBoard() {
             key={c.n}
             style={{ "--i": i } as CSSProperties}
           >
-            <span className="board-knob" style={svar(stateColor[p.cars[i]])} />
+            <span className="knob" style={svar(stateColor[p.cars[i]])} />
             <span className="board-car-num">#{c.n}</span>
             <span className="board-car-body">
               <span className="board-car-ref">

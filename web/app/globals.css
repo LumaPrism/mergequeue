@@ -395,14 +395,14 @@ body::before {
 
 .stack {
   position: relative;
-  padding-left: 72px;
+  padding-left: 60px;
   display: flex;
   flex-direction: column;
   gap: var(--s-4);
 }
 .rail {
   position: absolute;
-  left: 23px;
+  left: 21px;
   top: 28px;
   bottom: 28px;
   width: 2px;
@@ -446,11 +446,11 @@ body::before {
 
 .knob {
   position: absolute;
-  left: -55px;
+  left: -45px;
   top: 50%;
   transform: translateY(-50%);
-  width: 13px;
-  height: 13px;
+  width: 12px;
+  height: 12px;
   border-radius: 50%;
   background: var(--bg);
   border: 2px solid var(--s, var(--st-queued));
@@ -1769,9 +1769,9 @@ a.prlink:hover {
   flex-direction: column;
   gap: var(--s-3);
   min-height: 96px;
-  padding: var(--s-2);
+  padding: var(--s-2) 0;
   border-radius: var(--r-lg);
-  border: 1px dashed transparent;
+  border: 0;
   transition: background var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease),
     box-shadow var(--dur-2) var(--ease);
 }

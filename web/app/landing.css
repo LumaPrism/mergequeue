@@ -284,75 +284,6 @@
   color: var(--accent);
 }
 
-.lp-board-track {
-  position: relative;
-  padding-left: 60px;
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-3);
-}
-.board-rail {
-  position: absolute;
-  left: 21px;
-  top: 18px;
-  bottom: 18px;
-  width: 2px;
-  border-radius: 2px;
-  background: var(--line-2);
-  overflow: hidden;
-  pointer-events: none;
-  transition: background var(--dur-3) var(--ease);
-}
-.lp-board[data-rail="testing"] .board-rail {
-  background: color-mix(in srgb, var(--st-testing) 34%, var(--line-2));
-}
-.lp-board[data-rail="merging"] .board-rail {
-  background: color-mix(in srgb, var(--st-merge) 42%, var(--line-2));
-}
-.lp-board[data-rail="ejecting"] .board-rail {
-  background: color-mix(in srgb, var(--st-eject) 40%, var(--line-2));
-}
-.board-surge {
-  position: absolute;
-  left: -1px;
-  right: -1px;
-  height: 34%;
-  border-radius: 2px;
-  opacity: 0;
-}
-.lp-board[data-rail="testing"] .board-surge {
-  background: linear-gradient(to top, transparent, var(--st-testing), transparent);
-  animation: surge var(--rail-test) var(--ease) infinite;
-}
-.lp-board[data-rail="merging"] .board-surge {
-  background: linear-gradient(to top, transparent, var(--st-merge), transparent);
-  animation: surge 1.3s var(--ease) infinite;
-}
-.lp-board[data-rail="ejecting"] .board-surge {
-  background: linear-gradient(to top, transparent, var(--st-eject), transparent);
-  animation: surge 0.9s var(--ease) infinite;
-}
-
-.board-knob {
-  position: absolute;
-  left: -44px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: var(--bg);
-  border: 2px solid var(--s, var(--st-queued));
-  box-shadow: 0 0 12px -3px color-mix(in srgb, var(--s, transparent) 80%, transparent);
-}
-.board-knob.is-main {
-  width: 14px;
-  height: 14px;
-  left: -45px;
-  background: var(--s);
-  box-shadow: 0 0 14px -2px color-mix(in srgb, var(--s) 85%, transparent);
-}
-
 .board-main {
   position: relative;
   display: flex;
@@ -364,7 +295,7 @@
   background: color-mix(in srgb, var(--st-merge) 6%, transparent);
   transition: box-shadow var(--dur-4) var(--ease), border-color var(--dur-4) var(--ease);
 }
-.lp-board[data-rail="merging"] .board-main {
+.stack[data-rail="merging"] .board-main {
   border-color: color-mix(in srgb, var(--st-merge) 55%, transparent);
   box-shadow: var(--elev-3), 0 0 34px -10px color-mix(in srgb, var(--st-merge) 65%, transparent);
 }
@@ -864,7 +795,7 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .board-car,
-  .board-surge {
+  .surge {
     animation: none;
   }
   .board-car.is-out,
