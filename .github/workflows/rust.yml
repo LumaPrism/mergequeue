@@ -5,10 +5,14 @@ on:
     branches: [main]
     paths:
       - backend/**
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/rust.yml
   pull_request:
     paths:
       - backend/**
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/rust.yml
   workflow_dispatch:
 
@@ -45,4 +49,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
-        run: cargo test --all
+        # Serial: the engine tests share one mergequeue_test database and TRUNCATE
+        # between cases, so they must not run concurrently (belt-and-suspenders to
+        # the in-process DB_LOCK).
+        run: cargo test --all -- --test-threads=1
