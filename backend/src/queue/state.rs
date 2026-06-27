@@ -32,8 +32,9 @@ pub enum Observation {
     Blocked,
     /// No active batch; the next `batch_size` queued entry ids (possibly empty).
     Empty { queued: Vec<Uuid> },
-    /// An active batch plus the live fact for its current state.
-    Active { batch: BatchView, fact: Fact },
+    /// An active batch plus the live fact for its current state. The `BatchView` is
+    /// boxed to keep this transient enum small.
+    Active { batch: Box<BatchView>, fact: Fact },
 }
 
 /// The persisted batch projected for decisions, loaded fresh every loop step.
@@ -42,6 +43,8 @@ pub struct BatchView {
     pub id: Uuid,
     /// The repo this batch belongs to — carried into the ledger record.
     pub repo_id: Uuid,
+    /// The queue this batch belongs to — carried into the ledger record.
+    pub queue_id: Uuid,
     pub state: BatchState,
     /// Base tip captured at the reset step; empty until then (race guard inactive).
     pub base_sha: String,
@@ -156,6 +159,7 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbWrite {
     CreateBatch {
+        queue_id: Uuid,
         entry_ids: Vec<Uuid>,
         staging_ref: String,
     },
@@ -222,6 +226,7 @@ pub struct LedgerEntry {
 pub struct LedgerRecord {
     pub batch_id: Uuid,
     pub repo_id: Uuid,
+    pub queue_id: Uuid,
     pub outcome: LedgerOutcome,
     pub base_sha: String,
     pub landed_sha: Option<String>,
@@ -245,6 +250,7 @@ impl LedgerRecord {
         Self {
             batch_id: batch.id,
             repo_id: batch.repo_id,
+            queue_id: batch.queue_id,
             outcome: LedgerOutcome::Merged,
             base_sha: batch.base_sha.clone(),
             landed_sha: Some(staging_sha.to_owned()),
@@ -272,6 +278,7 @@ impl LedgerRecord {
         Self {
             batch_id: batch.id,
             repo_id: batch.repo_id,
+            queue_id: batch.queue_id,
             outcome: LedgerOutcome::Ejected,
             base_sha: batch.base_sha.clone(),
             landed_sha: None,
@@ -295,6 +302,7 @@ impl LedgerRecord {
         Self {
             batch_id: batch.id,
             repo_id: batch.repo_id,
+            queue_id: batch.queue_id,
             outcome: LedgerOutcome::Superseded,
             base_sha: batch.base_sha.clone(),
             landed_sha: None,
@@ -322,6 +330,7 @@ impl LedgerRecord {
         Self {
             batch_id: batch.id,
             repo_id: batch.repo_id,
+            queue_id: batch.queue_id,
             outcome: LedgerOutcome::Superseded,
             base_sha: batch.base_sha.clone(),
             landed_sha: None,
@@ -386,29 +395,30 @@ pub enum Flow {
 pub struct State;
 
 impl State {
-    /// `None` ⇒ no real CI reported yet → hold. `Some(set)` ⇒ gate on exactly
-    /// these contexts (empty when a PR legitimately triggers none → it merges).
+    /// `None` ⇒ none of the required contexts have reported yet → hold (never merge
+    /// ungated). `Some(set)` ⇒ gate on exactly these reported-and-required contexts.
+    /// An empty intersection (nothing required has reported — whether nothing reported
+    /// at all, only the legacy badge, or only non-required contexts) is `None`: the
+    /// engine must not conclude a silent pass from the absence of a required check.
     pub fn applicable_checks(
         required: &[String],
         reported_per_pr: &[Vec<String>],
     ) -> Option<Vec<String>> {
         let mut applicable: BTreeSet<String> = BTreeSet::new();
-        let mut any = false;
         for reported in reported_per_pr {
             for ctx in reported {
                 if ctx == LEGACY_BADGE_CONTEXT {
                     continue;
                 }
-                any = true;
                 if required.iter().any(|r| r == ctx) {
                     applicable.insert(ctx.clone());
                 }
             }
         }
-        if any {
-            Some(applicable.into_iter().collect())
-        } else {
+        if applicable.is_empty() {
             None
+        } else {
+            Some(applicable.into_iter().collect())
         }
     }
 
@@ -420,6 +430,7 @@ impl State {
             Observation::Empty { queued } => Decision {
                 effects: vec![Effect::Db(vec![
                     DbWrite::CreateBatch {
+                        queue_id: cfg.queue_id,
                         entry_ids: queued.clone(),
                         staging_ref: cfg.staging_ref(),
                     },
@@ -620,6 +631,7 @@ impl State {
             },
             DbWrite::AppendLedger(LedgerRecord::superseded(batch)),
             DbWrite::CreateBatch {
+                queue_id: cfg.queue_id,
                 entry_ids: first.clone(),
                 staging_ref: cfg.staging_ref(),
             },
@@ -803,7 +815,9 @@ mod tests {
 
     fn cfg() -> RepoQueueConfig {
         RepoQueueConfig {
+            queue_id: Uuid::nil(),
             repo_id: Uuid::nil(),
+            name: "default".into(),
             base_branch: "main".into(),
             batch_size: 2,
             required_checks: vec!["ci".into()],
@@ -829,10 +843,11 @@ mod tests {
         BatchView {
             id: Uuid::from_u128(9000),
             repo_id: Uuid::nil(),
+            queue_id: Uuid::nil(),
             state,
             base_sha: base_sha.into(),
             staging_sha: staging_sha.map(str::to_owned),
-            staging_ref: "mq/staging/main".into(),
+            staging_ref: "mq/staging/default/main".into(),
             merge_blocked: false,
             entries,
             created_at: DateTime::<Utc>::UNIX_EPOCH,
@@ -840,7 +855,10 @@ mod tests {
     }
 
     fn active(batch: BatchView, fact: Fact) -> Observation {
-        Observation::Active { batch, fact }
+        Observation::Active {
+            batch: Box::new(batch),
+            fact,
+        }
     }
 
     fn idx(effects: &[Effect], pred: impl Fn(&Effect) -> bool) -> Option<usize> {
@@ -897,8 +915,9 @@ mod tests {
             d.effects,
             vec![Effect::Db(vec![
                 DbWrite::CreateBatch {
+                    queue_id: Uuid::nil(),
                     entry_ids: ids.clone(),
-                    staging_ref: "mq/staging/main".into()
+                    staging_ref: "mq/staging/default/main".into()
                 },
                 DbWrite::SetEntriesState {
                     entry_ids: ids,
@@ -925,7 +944,7 @@ mod tests {
             d.effects,
             vec![
                 Effect::Gh(GhCall::ForceRef {
-                    staging_ref: "mq-tmp/staging/main".into(),
+                    staging_ref: "mq-tmp/staging/default/main".into(),
                     sha: "base9".into()
                 }),
                 Effect::Db(vec![DbWrite::SetBatchBaseSha {
@@ -950,12 +969,12 @@ mod tests {
         assert_eq!(
             d.effects,
             vec![Effect::Gh(GhCall::MergeOnto {
-                staging_ref: "mq-tmp/staging/main".into(),
+                staging_ref: "mq-tmp/staging/default/main".into(),
                 head: "h7".into(),
-                message: "mq: merge #7 into mq-tmp/staging/main".into(),
+                message: "mq: merge #7 into mq-tmp/staging/default/main".into(),
                 entry_id: Uuid::from_u128(7),
                 pr_number: 7,
-                seed_from: "mq/staging/main".into(),
+                seed_from: "mq/staging/default/main".into(),
             })]
         );
     }
@@ -1041,7 +1060,7 @@ mod tests {
         assert_eq!(
             d.effects[0],
             Effect::Gh(GhCall::ForceRef {
-                staging_ref: "mq/staging/main".into(),
+                staging_ref: "mq/staging/default/main".into(),
                 sha: "stg".into()
             }),
             "the real staging ref is flipped to the assembled tip first"
@@ -1064,7 +1083,7 @@ mod tests {
         assert_eq!(
             d.effects.last(),
             Some(&Effect::Gh(GhCall::DeleteRef {
-                staging_ref: "mq-tmp/staging/main".into()
+                staging_ref: "mq-tmp/staging/default/main".into()
             })),
             "the assembly ref is dropped last, after the batch is persisted staged"
         );
@@ -1343,8 +1362,9 @@ mod tests {
             "n=3 keeps first 2, requeues last 1"
         );
         assert!(writes.contains(&DbWrite::CreateBatch {
+            queue_id: Uuid::nil(),
             entry_ids: vec![Uuid::from_u128(7), Uuid::from_u128(8)],
-            staging_ref: "mq/staging/main".into()
+            staging_ref: "mq/staging/default/main".into()
         }));
     }
 
@@ -1362,10 +1382,11 @@ mod tests {
     }
 
     #[test]
-    fn test_state_applicable_path_filtered_is_empty_some() {
+    fn test_state_applicable_no_required_reported_holds() {
         assert_eq!(
             State::applicable_checks(&["ci".into()], &[vec!["changes".into()]]),
-            Some(vec![])
+            None,
+            "a non-empty required set with no required context reported must hold, not merge"
         );
     }
 
@@ -1456,6 +1477,28 @@ mod tests {
             rec.entries
                 .iter()
                 .all(|e| e.result == LedgerEntryResult::Requeued)
+        );
+    }
+
+    #[test]
+    fn test_state_staging_ref_is_queue_scoped() {
+        let mut fe = cfg();
+        fe.name = "frontend".into();
+        let mut be = cfg();
+        be.name = "backend".into();
+        assert_eq!(fe.staging_ref(), "mq/staging/frontend/main");
+        assert_eq!(be.staging_ref(), "mq/staging/backend/main");
+        assert_ne!(
+            fe.staging_ref(),
+            be.staging_ref(),
+            "two queues on the same base must not share a staging ref"
+        );
+        let mut v = batch(BatchState::Staging, "b", None, vec![]);
+        v.staging_ref = fe.staging_ref();
+        assert_eq!(
+            v.assembly_ref(),
+            "mq-tmp/staging/frontend/main",
+            "the CI-silent assembly ref keeps the queue segment"
         );
     }
 

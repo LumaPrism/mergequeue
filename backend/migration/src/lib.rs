@@ -6,6 +6,7 @@ mod m20260625_165821_auth;
 mod m20260626_111218_staging_progress;
 mod m20260626_115024_merge_blocked;
 mod m20260626_182440_queue_ledger;
+mod m20260627_092129_queues;
 
 pub struct Migrator;
 
@@ -19,6 +20,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260626_111218_staging_progress::Migration),
             Box::new(m20260626_115024_merge_blocked::Migration),
             Box::new(m20260626_182440_queue_ledger::Migration),
+            Box::new(m20260627_092129_queues::Migration),
         ]
     }
 }

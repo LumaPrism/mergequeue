@@ -31,24 +31,33 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 
 import { ActiveBatch } from "@/components/ActiveBatch";
-import { RunHistory } from "@/components/RunHistory";
+import { DeparturesBoard } from "@/components/RunHistory";
+import { PlatformSwitcher } from "@/components/PlatformSwitcher";
 import { SetupGate } from "@/components/SetupGate";
 import {
+  ApiError,
   PrStatus,
+  createQueue,
   dequeue,
   enqueue,
   getLedger,
   getMe,
   getOpenPrs,
   getQueue,
+  getQueues,
   getRepos,
   reorder,
 } from "@/lib/api";
-import type { EntryView, LedgerView, MeView, PrView, RepoView } from "@/lib/api";
+import type { EntryView, LedgerView, MeView, PrView, QueueView, RepoView } from "@/lib/api";
 import { relTime } from "@/lib/rel-time";
 import { stateColor, statusColor, statusInk, svar } from "@/lib/state";
 
 const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
+
+/// A failed enqueue, captured for the confirm dialog. `fixable` errors (a 4xx the
+/// backend explains — wrong base, already on another queue) show `message`
+/// verbatim; everything else reads as a transient hiccup the user can retry.
+type AddError = { fixable: boolean; message: string };
 
 /// Loading placeholders sized to the real cars / PR cards, so swapping in content
 /// causes no layout shift. Its own component — any column drops it in.
@@ -135,6 +144,9 @@ function RepoSelect({
   const [active, setActive] = useState(0);
   const btnRef = useRef<HTMLButtonElement>(null);
   const current = repos.find((r) => r.id === sel);
+  const depthOf = (r: RepoView) => r.queues.reduce((n, q) => n + q.depth, 0);
+  const tracksOf = (r: RepoView) =>
+    `${r.queues.length} ${r.queues.length === 1 ? "track" : "tracks"}`;
 
   useEffect(() => {
     if (!open) return;
@@ -200,7 +212,7 @@ function RepoSelect({
         <span className="rsel-current">
           {current ? `${current.owner}/${current.name}` : "select a repo"}
         </span>
-        {current ? <span className="rsel-q">{current.queued} queued</span> : null}
+        {current ? <span className="rsel-q">{depthOf(current)} queued</span> : null}
         <span className="rsel-caret" aria-hidden>
           ▾
         </span>
@@ -225,9 +237,9 @@ function RepoSelect({
                 <span className="rsel-opt-name">
                   {r.owner}/{r.name}
                 </span>
-                <span className="rsel-opt-base">{r.baseBranch}</span>
+                <span className="rsel-opt-base">{tracksOf(r)}</span>
               </span>
-              <span className="rsel-opt-q">{r.queued} queued</span>
+              <span className="rsel-opt-q">{depthOf(r)} queued</span>
             </li>
           ))}
         </ul>
@@ -397,6 +409,7 @@ function TrainZone({ active, children }: { active: boolean; children: ReactNode 
 function ConfirmModal({
   pr,
   repo,
+  queue,
   busy,
   addErr,
   onCancel,
@@ -404,8 +417,9 @@ function ConfirmModal({
 }: {
   pr: PrView;
   repo: RepoView;
+  queue: QueueView;
   busy: boolean;
-  addErr: boolean;
+  addErr: AddError | null;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -455,17 +469,19 @@ function ConfirmModal({
         onClick={stop}
       >
         <h2 id="mq-modal-title" className="modal-title">
-          Add #{pr.number} to the {repo.baseBranch} train?
+          Add #{pr.number} to the <b>{queue.name}</b> track?
         </h2>
         <p className="modal-pr">{pr.title}</p>
         <p id="mq-modal-note" className="modal-note">
           <b>mergequeue</b> stages it on a throwaway branch, waits for {repo.name}&apos;s required
-          checks, and merges into <b>{repo.baseBranch}</b> if they pass. If the repo has no required
+          checks, and merges into <b>{queue.baseBranch}</b> if they pass. If the repo has no required
           checks, it&apos;s held — never merged ungated.
         </p>
         {addErr ? (
-          <p className="modal-error" role="alert">
-            Couldn&apos;t add this PR. Check the App is installed on {repo.name}, then retry.
+          <p className={`modal-error ${addErr.fixable ? "caution" : ""}`} role="alert">
+            {addErr.fixable
+              ? addErr.message
+              : `Couldn’t add this PR — this is usually transient. Check the App is installed on ${repo.name}, then retry.`}
           </p>
         ) : null}
         <div className="modal-actions">
@@ -479,7 +495,7 @@ function ConfirmModal({
             disabled={busy}
             onClick={onConfirm}
           >
-            {busy ? "Adding…" : addErr ? "Retry" : "Add to train"}
+            {busy ? "Adding…" : addErr && !addErr.fixable ? "Retry" : "Add to train"}
           </button>
         </div>
       </div>
@@ -496,16 +512,18 @@ export default function Dashboard() {
   const [minOver, setMinOver] = useState(false);
   const [prsReady, setPrsReady] = useState(false);
   const [sel, setSel] = useState<string | null>(null);
+  const [queues, setQueues] = useState<QueueView[]>([]);
+  const [selQueue, setSelQueue] = useState<string | null>(null);
   const [queue, setQueue] = useState<EntryView[]>([]);
   const [prs, setPrs] = useState<PrView[]>([]);
   const [prsErr, setPrsErr] = useState(false);
   const [queueErr, setQueueErr] = useState(false);
   const [busy, setBusy] = useState<number | null>(null);
   const [confirming, setConfirming] = useState<PrView | null>(null);
-  const [addErr, setAddErr] = useState(false);
+  const [addErr, setAddErr] = useState<AddError | null>(null);
   const [dragId, setDragId] = useState<string | null>(null);
   const [prFilter, setPrFilter] = useState("");
-  const [undo, setUndo] = useState<{ entry: EntryView; index: number; repoId: string } | null>(
+  const [undo, setUndo] = useState<{ entry: EntryView; index: number; queueId: string } | null>(
     null,
   );
   const [ledger, setLedger] = useState<LedgerView[]>([]);
@@ -519,18 +537,13 @@ export default function Dashboard() {
 
   const selRef = useRef(sel);
   selRef.current = sel;
+  const selQueueRef = useRef(selQueue);
+  selQueueRef.current = selQueue;
 
-  // Ignore any response whose repo is no longer selected — a slow fetch for repo A
-  // must never write A's data after the user has switched to B.
-  const refresh = (repoId: string) => {
-    getQueue(repoId)
-      .then((q) => {
-        if (repoId !== selRef.current) return;
-        setQueue(q);
-        setQueueErr(false);
-        setSyncedAt(Date.now());
-      })
-      .catch(() => repoId === selRef.current && setQueueErr(true));
+  // Repo-scoped data (PR candidates + the platform switcher's live tracks). Ignore
+  // any response whose repo is no longer selected — a slow fetch for repo A must
+  // never write A's data after the user has switched to B.
+  const refreshRepoScope = (repoId: string) => {
     getOpenPrs(repoId)
       .then((p) => {
         if (repoId !== selRef.current) return;
@@ -544,12 +557,39 @@ export default function Dashboard() {
         setPrsErr(true);
         setPrsReady(true);
       });
-    getLedger(repoId)
-      .then((l) => {
+    getQueues(repoId)
+      .then((qs) => {
         if (repoId !== selRef.current) return;
+        setQueues(qs);
+      })
+      .catch(() => {});
+  };
+
+  // Queue-scoped data (the train + the departures board). Guarded by the selected
+  // queue id so a slow fetch for track A never lands after a switch to track B.
+  const refreshQueueScope = (queueId: string) => {
+    getQueue(queueId)
+      .then((q) => {
+        if (queueId !== selQueueRef.current) return;
+        setQueue(q);
+        setQueueErr(false);
+        setSyncedAt(Date.now());
+      })
+      .catch(() => queueId === selQueueRef.current && setQueueErr(true));
+    getLedger(queueId)
+      .then((l) => {
+        if (queueId !== selQueueRef.current) return;
         setLedger(l);
       })
       .catch(() => {});
+  };
+
+  // Refresh whatever is in view now (both scopes), reading the live refs.
+  const refresh = () => {
+    const r = selRef.current;
+    const q = selQueueRef.current;
+    if (r) refreshRepoScope(r);
+    if (q) refreshQueueScope(q);
   };
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
@@ -557,13 +597,13 @@ export default function Dashboard() {
   const pauseRef = useRef(false);
   pauseRef.current = dragId !== null || confirming !== null || busy !== null || undo !== null;
 
-  // Commit a removal to the backend against the repo it was removed from, and only
-  // refresh if we're still viewing that repo (else we'd overwrite another repo's queue).
-  const commitRemove = (repoId: string, entryId: string) => {
-    dequeue(repoId, entryId)
+  // Commit a removal to the backend against the track it was removed from, and only
+  // refresh if we're still viewing that track (else we'd overwrite another's queue).
+  const commitRemove = (queueId: string, entryId: string) => {
+    dequeue(queueId, entryId)
       .catch(() => {})
       .finally(() => {
-        if (repoId === selRef.current) refreshRef.current(repoId);
+        if (queueId === selQueueRef.current) refreshRef.current();
       });
   };
 
@@ -597,18 +637,33 @@ export default function Dashboard() {
     };
   }, [authed]);
 
+  // Repo switch: seed the platform switcher from the repo's embedded queues for an
+  // instant paint, default-select its `default` track, then refetch repo-scoped data
+  // (PR candidates + the live tracks with their active-batch aspect pips).
   useEffect(() => {
     if (!sel) return;
-    setQueue([]);
-    setSyncedAt(null);
-    setQueueErr(false);
+    const repo = repos.find((r) => r.id === sel);
+    const seeded = repo?.queues ?? [];
+    setQueues(seeded);
+    const def = seeded.find((q) => q.name === "default") ?? seeded[0] ?? null;
+    setSelQueue(def?.id ?? null);
     setPrs([]);
     setPrsErr(false);
     setPrsReady(false);
-    setLedger([]);
-    refresh(sel);
+    refreshRepoScope(sel);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sel]);
+
+  // Track switch: reset the train + departures board, then load the selected queue.
+  useEffect(() => {
+    if (!selQueue) return;
+    setQueue([]);
+    setSyncedAt(null);
+    setQueueErr(false);
+    setLedger([]);
+    refreshQueueScope(selQueue);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selQueue]);
 
   // Keep the loading skeleton up for a brief minimum so a fast load doesn't flash
   // it for a frame — restarts on first auth and on every repo switch.
@@ -620,12 +675,12 @@ export default function Dashboard() {
   }, [authed, sel]);
 
   useEffect(() => {
-    if (!sel) return;
+    if (!authed) return;
     const t = window.setInterval(() => {
-      if (!pauseRef.current) refreshRef.current(sel);
+      if (!pauseRef.current) refreshRef.current();
     }, 10000);
     return () => window.clearInterval(t);
-  }, [sel]);
+  }, [authed]);
 
   useEffect(() => {
     const t = window.setInterval(() => setNow(Date.now()), 1000);
@@ -636,6 +691,8 @@ export default function Dashboard() {
   if (!authed) return <LoginScreen />;
 
   const repo = repos.find((r) => r.id === sel) ?? null;
+  const activeQueue = queues.find((q) => q.id === selQueue) ?? null;
+  const baseBranch = activeQueue?.baseBranch;
   // Each column keeps its skeleton until ITS data is in — and for a brief minimum —
   // so neither flashes the empty state mid-load (queue and PRs resolve independently).
   const queueLoading = !minOver || !reposLoaded || syncedAt === null;
@@ -644,7 +701,7 @@ export default function Dashboard() {
   const prByNum = new Map(prs.map((p) => [p.number, p] as const));
   const pinned = queue.filter((e) => e.status !== PrStatus.Queued);
   const cars = queue.filter((e) => e.status === PrStatus.Queued);
-  const batchSize = repo?.batchSize ?? 0;
+  const batchSize = activeQueue?.batchSize ?? 0;
   const filter = prFilter.trim().toLowerCase();
   const shownPrs = filter
     ? prs.filter((p) => `#${p.number} ${p.title} ${p.headRef}`.toLowerCase().includes(filter))
@@ -691,10 +748,19 @@ export default function Dashboard() {
   const ghUrl = (n: number) =>
     repo ? `https://github.com/${repo.owner}/${repo.name}/pull/${n}` : "#";
 
-  const doQueue = async (pr: PrView) => {
+  const createTrack = async (name: string) => {
     if (!sel) return;
+    const created = await createQueue(sel, { name });
+    const qs = await getQueues(sel);
+    if (sel !== selRef.current) return;
+    setQueues(qs);
+    setSelQueue(created.id);
+  };
+
+  const doQueue = async (pr: PrView) => {
+    if (!selQueue) return;
     setBusy(pr.number);
-    setAddErr(false);
+    setAddErr(null);
     const tempId = `tmp:${pr.number}`;
     setQueue((q) =>
       q.some((e) => e.prNumber === pr.number)
@@ -702,39 +768,45 @@ export default function Dashboard() {
         : [...q, { id: tempId, prNumber: pr.number, position: q.length, status: PrStatus.Queued }],
     );
     try {
-      await enqueue(sel, pr.number);
+      await enqueue(selQueue, pr.number);
       setConfirming(null);
-      refresh(sel);
-    } catch {
+      refresh();
+    } catch (err) {
       setQueue((q) => q.filter((e) => e.id !== tempId));
-      setAddErr(true);
+      // 409 AlreadyQueued / 422 WrongBase carry a message the user can act on;
+      // show it verbatim. Anything else (5xx, network) reads as transient.
+      setAddErr(
+        err instanceof ApiError
+          ? { fixable: err.userFixable, message: err.message }
+          : { fixable: false, message: "" },
+      );
     } finally {
       setBusy(null);
     }
   };
 
   const doRemove = (entry: EntryView) => {
-    if (!sel) return;
+    if (!selQueue) return;
     // Only the latest removal is undoable. If one is still pending, commit it now
-    // (against ITS repo) so its dequeue is never dropped by the new one.
+    // (against ITS track) so its dequeue is never dropped by the new one.
     if (undo && undoTimer.current !== null) {
       window.clearTimeout(undoTimer.current);
-      commitRemove(undo.repoId, undo.entry.id);
+      commitRemove(undo.queueId, undo.entry.id);
     }
-    const repoId = sel;
+    const queueId = selQueue;
     const index = Math.max(0, queue.findIndex((e) => e.id === entry.id));
     setQueue((q) => q.filter((e) => e.id !== entry.id));
-    setUndo({ entry, index, repoId });
+    setUndo({ entry, index, queueId });
     undoTimer.current = window.setTimeout(() => {
       undoTimer.current = null;
       setUndo(null);
-      commitRemove(repoId, entry.id);
+      commitRemove(queueId, entry.id);
     }, 5000);
   };
 
   const undoRemove = () => {
-    // Don't splice a removal from another repo into the one now on screen.
-    if (!undo || undo.repoId !== selRef.current) return;
+    // Don't splice a removal from another track into the one now on screen.
+    if (!undo || undo.queueId !== selQueueRef.current) return;
     if (undoTimer.current !== null) {
       window.clearTimeout(undoTimer.current);
       undoTimer.current = null;
@@ -753,7 +825,7 @@ export default function Dashboard() {
   const onDragEnd = (e: DragEndEvent) => {
     setDragId(null);
     const { active, over } = e;
-    if (!over || !sel) return;
+    if (!over || !selQueue) return;
     const type = active.data.current?.type;
     if (type === "pr") {
       setConfirming(active.data.current?.pr as PrView);
@@ -769,11 +841,11 @@ export default function Dashboard() {
       const removedId = undo?.entry.id;
       setQueue([...pinned, ...reordered]);
       reorder(
-        sel,
+        selQueue,
         reordered.map((c) => c.id),
       )
         .then((q) => setQueue(removedId ? q.filter((e) => e.id !== removedId) : q))
-        .catch(() => refresh(sel));
+        .catch(() => refresh());
     }
   };
 
@@ -833,22 +905,33 @@ export default function Dashboard() {
                 </span>
               ) : null}
             </h1>
-            {repo && (
-              <div className="sb-ctx">
-                <span className="sb-ctx-item">
-                  <span className="sb-ctx-k">base</span>
-                  <b>{repo.baseBranch}</b>
-                </span>
-                <span className="sb-ctx-item">
-                  <span className="sb-ctx-k">batch</span>
-                  <b>{repo.batchSize}</b>
-                </span>
-                <span className="sb-ctx-cap">
-                  Queued PRs ride the train; cars land into {repo.baseBranch} in merge order.
-                </span>
-              </div>
-            )}
           </section>
+
+          {repo && queues.length > 0 ? (
+            <PlatformSwitcher
+              queues={queues}
+              selected={selQueue}
+              onSelect={(id) => setSelQueue(id)}
+              onCreate={createTrack}
+            />
+          ) : null}
+
+          {activeQueue && (
+            <div className="sb-ctx">
+              <span className="sb-ctx-item">
+                <span className="sb-ctx-k">base</span>
+                <b>{activeQueue.baseBranch}</b>
+              </span>
+              <span className="sb-ctx-item">
+                <span className="sb-ctx-k">batch</span>
+                <b>{activeQueue.batchSize}</b>
+              </span>
+              <span className="sb-ctx-cap">
+                Queued PRs ride the <b>{activeQueue.name}</b> track; cars land into{" "}
+                {activeQueue.baseBranch} in merge order.
+              </span>
+            </div>
+          )}
 
           <DndContext
             sensors={sensors}
@@ -864,18 +947,14 @@ export default function Dashboard() {
 
                 <div className="node dest" style={{ ...svar(stateColor.merged), ["--i"]: 0 } as CSSProperties}>
                   <span className="knob full" style={svar(stateColor.merged)} />
-                  <span className="label">{repo?.baseBranch ?? "main"}</span>
+                  <span className="label">{baseBranch ?? "main"}</span>
                   <span className="meta">green cars land here</span>
                 </div>
 
                 {queueErr && queue.length === 0 ? (
                   <div className="errcard" role="alert">
                     <span className="errcard-msg">Couldn&apos;t load the train.</span>
-                    <button
-                      type="button"
-                      className="errcard-btn"
-                      onClick={() => sel && refresh(sel)}
-                    >
+                    <button type="button" className="errcard-btn" onClick={() => refresh()}>
                       Retry
                     </button>
                   </div>
@@ -890,7 +969,7 @@ export default function Dashboard() {
                         stage={batchStage}
                         prByNum={prByNum}
                         ghUrl={ghUrl}
-                        baseBranch={repo?.baseBranch}
+                        baseBranch={baseBranch}
                         onRemove={doRemove}
                       />
                     )}
@@ -903,7 +982,7 @@ export default function Dashboard() {
                           <span className="qempty-sub">
                             {prs.length === 0
                               ? "Open a pull request, then add it here to start the train."
-                              : `Add a ready PR to start the train — cars land into ${repo?.baseBranch ?? "main"} in order.`}
+                              : `Add a ready PR to start the train — cars land into ${baseBranch ?? "main"} in order.`}
                           </span>
                           {prs.length > 0 && shownPrs[0] ? (
                             <button
@@ -995,9 +1074,10 @@ export default function Dashboard() {
                     </>
                   )}
                 </div>
-
               </aside>
             </div>
+
+            <DeparturesBoard rows={ledger} track={activeQueue?.name} loading={queueLoading} />
 
             <DragOverlay>
               {dragPr ? (
@@ -1015,7 +1095,6 @@ export default function Dashboard() {
               ) : null}
             </DragOverlay>
           </DndContext>
-          <RunHistory rows={ledger} />
         </>
       )}
 
@@ -1025,21 +1104,22 @@ export default function Dashboard() {
         <span style={{ marginLeft: "auto", color: "var(--text-meta)" }}>self-hosted</span>
       </footer>
 
-      {confirming && repo ? (
+      {confirming && repo && activeQueue ? (
         <ConfirmModal
           pr={confirming}
           repo={repo}
+          queue={activeQueue}
           busy={busy === confirming.number}
           addErr={addErr}
           onCancel={() => {
             setConfirming(null);
-            setAddErr(false);
+            setAddErr(null);
           }}
           onConfirm={() => doQueue(confirming)}
         />
       ) : null}
 
-      {undo && undo.repoId === sel
+      {undo && undo.queueId === selQueue
         ? createPortal(
             <div className="toast" role="status" aria-live="polite">
               <span className="toast-msg">Removed #{undo.entry.prNumber} from the train</span>

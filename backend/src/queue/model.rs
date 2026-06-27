@@ -57,8 +57,9 @@ impl EntryState {
 pub struct QueueEntry {
     pub id: Uuid,
     pub repo_id: Uuid,
+    pub queue_id: Uuid,
     pub pr_number: u64,
-    /// Ordering within the repo's queue. Lower merges first.
+    /// Ordering within the queue. Lower merges first.
     pub position: i32,
     pub state: EntryState,
     pub enqueued_by: String,
@@ -146,6 +147,7 @@ impl BatchState {
 pub struct Batch {
     pub id: Uuid,
     pub repo_id: Uuid,
+    pub queue_id: Uuid,
     /// Entries in this batch, in queue order.
     pub entry_ids: Vec<Uuid>,
     /// Base tip captured when the batch was staged — if base moves past this, re-stage.
@@ -214,10 +216,15 @@ pub enum LedgerOutcome {
     Superseded,
 }
 
-/// Per-repo queue settings (persisted; editable from the UI).
+/// Per-queue settings (persisted; editable from the UI). A repo may host several
+/// named queues, each with its own config and staging refs.
 #[derive(Debug, Clone)]
 pub struct RepoQueueConfig {
+    pub queue_id: Uuid,
+    /// The repo the queue belongs to — carries GitHub identity for ref/API calls.
     pub repo_id: Uuid,
+    /// Queue name; ref-safe and folded into the staging ref so queues never collide.
+    pub name: String,
     /// Target branch, e.g. `main`.
     pub base_branch: String,
     /// Max PRs per batch. Start at 1 to validate the loop, then raise.
@@ -225,15 +232,19 @@ pub struct RepoQueueConfig {
     /// Check-run / status contexts that must be green on the staging branch.
     pub required_checks: Vec<String>,
     pub merge_method: MergeMethod,
-    /// Staging branch prefix; full ref is `<prefix>/<base_branch>`.
+    /// Staging branch prefix; full ref is `<prefix>/<name>/<base_branch>`.
     pub staging_prefix: String,
 }
 
 impl RepoQueueConfig {
+    /// The queue-scoped staging ref, `<prefix>/<name>/<base_branch>` — folding the
+    /// queue name in keeps two queues on the same base from sharing a staging branch
+    /// (and the `assembly_ref` derived from it stays CI-silent and collision-free).
     pub fn staging_ref(&self) -> String {
         format!(
-            "{}/{}",
+            "{}/{}/{}",
             self.staging_prefix.trim_end_matches('/'),
+            self.name,
             self.base_branch
         )
     }

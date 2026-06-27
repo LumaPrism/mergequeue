@@ -373,7 +373,7 @@ impl RepoClient for GitHubRepoClient {
         required: &[String],
     ) -> Result<CheckState, GitHubError> {
         if required.is_empty() {
-            return Ok(CheckState::Success);
+            return Ok(CheckState::Pending);
         }
         let gh = self.client(repo)?;
         let mut outcomes: HashMap<String, Outcome> = HashMap::new();

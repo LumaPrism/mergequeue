@@ -33,9 +33,6 @@ pub mod installation {
 pub mod repo {
     use sea_orm::entity::prelude::*;
 
-    use super::RequiredChecks;
-    use crate::queue::MergeMethod;
-
     #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
     #[sea_orm(table_name = "repos")]
     pub struct Model {
@@ -43,6 +40,28 @@ pub mod repo {
         pub id: Uuid,
         pub installation_pk: Uuid,
         pub owner: String,
+        pub name: String,
+        pub created_at: DateTimeWithTimeZone,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod queue {
+    use sea_orm::entity::prelude::*;
+
+    use super::RequiredChecks;
+    use crate::queue::MergeMethod;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "queues")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub repo_id: Uuid,
         pub name: String,
         pub base_branch: String,
         pub batch_size: i32,
@@ -69,6 +88,7 @@ pub mod queue_entry {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub repo_id: Uuid,
+        pub queue_id: Uuid,
         pub pr_number: i64,
         pub position: i32,
         pub state: EntryState,
@@ -94,6 +114,7 @@ pub mod batch {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub repo_id: Uuid,
+        pub queue_id: Uuid,
         pub base_sha: String,
         pub staging_sha: Option<String>,
         pub staging_ref: String,
@@ -119,6 +140,7 @@ pub mod queue_ledger {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub repo_id: Uuid,
+        pub queue_id: Uuid,
         #[sea_orm(unique)]
         pub batch_id: Uuid,
         pub outcome: LedgerOutcome,

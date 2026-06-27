@@ -23,7 +23,7 @@ use crate::queue::{
 };
 use crate::runtime::{AppOwner, Enqueued, Removed, Runtime};
 use crate::setup::resolve_credentials;
-use crate::store::{RepoSummary, Store, queue_ledger};
+use crate::store::{QueueSummary, RepoSummary, Store, queue_ledger};
 
 pub struct Api {
     pub cfg: Config,
@@ -135,7 +135,7 @@ impl LedgerView {
     }
 }
 
-/// A repo under management, with its live queue depth.
+/// A repo under management, with its named queues (the dashboard's switcher).
 #[typeshare]
 #[derive(Serialize, Object)]
 #[serde(rename_all = "camelCase")]
@@ -144,9 +144,7 @@ pub struct RepoView {
     pub id: String,
     pub owner: String,
     pub name: String,
-    pub base_branch: String,
-    pub batch_size: i32,
-    pub queued: i32,
+    pub queues: Vec<QueueView>,
 }
 
 impl From<RepoSummary> for RepoView {
@@ -155,11 +153,73 @@ impl From<RepoSummary> for RepoView {
             id: r.id.to_string(),
             owner: r.owner,
             name: r.name,
-            base_branch: r.base_branch,
-            batch_size: r.batch_size,
-            queued: r.queued as i32,
+            queues: r.queues.into_iter().map(QueueView::from).collect(),
         }
     }
+}
+
+/// One named queue with its config + live depth. `active` is the active-batch
+/// summary; it's populated by the per-repo queues endpoint and left `None` in the
+/// lightweight repo switcher.
+#[typeshare]
+#[derive(Serialize, Object)]
+#[serde(rename_all = "camelCase")]
+#[oai(rename_all = "camelCase")]
+pub struct QueueView {
+    pub id: String,
+    pub repo_id: String,
+    pub name: String,
+    pub base_branch: String,
+    pub batch_size: i32,
+    pub depth: i32,
+    pub active: Option<ActiveBatchView>,
+}
+
+impl From<QueueSummary> for QueueView {
+    fn from(q: QueueSummary) -> Self {
+        Self {
+            id: q.id.to_string(),
+            repo_id: q.repo_id.to_string(),
+            name: q.name,
+            base_branch: q.base_branch,
+            batch_size: q.batch_size,
+            depth: q.queued as i32,
+            active: None,
+        }
+    }
+}
+
+/// A compact summary of a queue's in-flight batch.
+#[typeshare]
+#[derive(Serialize, Object)]
+#[serde(rename_all = "camelCase")]
+#[oai(rename_all = "camelCase")]
+pub struct ActiveBatchView {
+    pub id: String,
+    pub state: BatchState,
+    #[typeshare(serialized_as = "Vec<u32>")]
+    pub prs: Vec<u64>,
+}
+
+impl ActiveBatchView {
+    fn of(batch: &BatchView) -> Self {
+        Self {
+            id: batch.id.to_string(),
+            state: batch.state,
+            prs: batch.prs(),
+        }
+    }
+}
+
+/// Create a queue: a name plus optional config overriding the repo's default queue.
+#[typeshare]
+#[derive(Deserialize, Object)]
+#[serde(rename_all = "camelCase")]
+#[oai(rename_all = "camelCase")]
+pub struct CreateQueueRequest {
+    pub name: String,
+    pub base_branch: Option<String>,
+    pub batch_size: Option<i32>,
 }
 
 #[typeshare]
@@ -248,6 +308,23 @@ impl Api {
             .map_err(|_| Error::from_string("invalid repo id", StatusCode::BAD_REQUEST))
     }
 
+    fn parse_queue(raw: &str) -> Result<Uuid> {
+        Uuid::parse_str(raw)
+            .map_err(|_| Error::from_string("invalid queue id", StatusCode::BAD_REQUEST))
+    }
+
+    /// A queue name is ref-safe iff it matches `^[a-z0-9][a-z0-9-]*$` — it's folded
+    /// directly into the staging ref.
+    fn is_ref_safe(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+            _ => return false,
+        }
+        name.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+
     fn db_err(e: sea_orm::DbErr) -> Error {
         Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
     }
@@ -294,6 +371,55 @@ impl Api {
             .map_err(Self::db_err)?
             .ok_or_else(Self::unauthorized)?;
         Ok(user.login)
+    }
+
+    fn forbidden() -> Error {
+        Error::from_string("forbidden", StatusCode::FORBIDDEN)
+    }
+
+    /// Whether `login` may write `repo_id` — the dashboard's write-authz gate,
+    /// mirroring the PR-comment command path. Fails closed if the permission check
+    /// itself errors, so a transient GitHub failure never grants access.
+    async fn can_write_repo(&self, repo_id: Uuid, login: &str) -> bool {
+        match self.rt.can_write(repo_id, login).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, login, "repo permission check failed");
+                false
+            }
+        }
+    }
+
+    /// Require a session AND write access to `repo_id`; returns the signed-in login.
+    /// 403 when the user can't write the repo.
+    async fn authorize_repo(
+        &self,
+        session: &Cookie<Option<String>>,
+        repo_id: Uuid,
+    ) -> Result<String> {
+        let login = self.require_session(session).await?;
+        if !self.can_write_repo(repo_id, &login).await {
+            return Err(Self::forbidden());
+        }
+        Ok(login)
+    }
+
+    /// Require a session AND write access to the queue's repo; returns the signed-in
+    /// login. 404 when the queue is unknown, 403 when the user can't write its repo.
+    async fn authorize_queue(
+        &self,
+        session: &Cookie<Option<String>>,
+        queue_id: Uuid,
+    ) -> Result<String> {
+        let login = self.require_session(session).await?;
+        let repo_id = Store::queue_repo_id(&self.db, queue_id)
+            .await
+            .map_err(Self::db_err)?
+            .ok_or_else(|| Error::from_string("unknown queue", StatusCode::NOT_FOUND))?;
+        if !self.can_write_repo(repo_id, &login).await {
+            return Err(Self::forbidden());
+        }
+        Ok(login)
     }
 }
 
@@ -390,19 +516,123 @@ impl Api {
         Ok(Json(pulls.into_iter().map(PrView::from).collect()))
     }
 
-    /// Current queue for a repo (the dashboard's main view).
-    #[oai(path = "/repos/:repo_id/queue", method = "get")]
-    async fn get_queue(
+    /// A repo's named queues, each with its config, live depth, and active-batch
+    /// summary (the per-repo queue switcher).
+    #[oai(path = "/repos/:repo_id/queues", method = "get")]
+    async fn list_queues(
         &self,
         repo_id: Path<String>,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
-    ) -> Result<Json<Vec<EntryView>>> {
-        self.require_session(&session).await?;
+    ) -> Result<Json<Vec<QueueView>>> {
         let repo_id = Self::parse_repo(&repo_id.0)?;
-        let entries = Store::list_entries(&self.db, repo_id)
+        self.authorize_repo(&session, repo_id).await?;
+        let summaries = Store::list_queues(&self.db, repo_id)
             .await
             .map_err(Self::db_err)?;
-        let batch = Store::active_batch_view(&self.db, repo_id)
+        let mut views = Vec::with_capacity(summaries.len());
+        for s in summaries {
+            let id = s.id;
+            let mut view = QueueView::from(s);
+            view.active = Store::active_batch_view(&self.db, id)
+                .await
+                .map_err(Self::db_err)?
+                .as_ref()
+                .map(ActiveBatchView::of);
+            views.push(view);
+        }
+        Ok(Json(views))
+    }
+
+    /// Create a named queue on a repo. Optional `baseBranch`/`batchSize` override the
+    /// repo's default queue config; everything else is inherited from it.
+    #[oai(path = "/repos/:repo_id/queues", method = "post")]
+    async fn create_queue(
+        &self,
+        repo_id: Path<String>,
+        body: Json<CreateQueueRequest>,
+        #[oai(name = "mq_session")] session: Cookie<Option<String>>,
+    ) -> Result<Json<QueueView>> {
+        let repo_id = Self::parse_repo(&repo_id.0)?;
+        self.authorize_repo(&session, repo_id).await?;
+        let name = body.0.name.trim().to_lowercase();
+        if !Self::is_ref_safe(&name) {
+            return Err(Error::from_string(
+                "queue name must match ^[a-z0-9][a-z0-9-]*$",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ));
+        }
+        if Store::queue_id_by_name(&self.db, repo_id, &name)
+            .await
+            .map_err(Self::db_err)?
+            .is_some()
+        {
+            return Err(Error::from_string(
+                format!("a queue named `{name}` already exists in this repo"),
+                StatusCode::CONFLICT,
+            ));
+        }
+        let default_id = Store::queue_id_by_name(&self.db, repo_id, "default")
+            .await
+            .map_err(Self::db_err)?
+            .ok_or_else(|| Error::from_string("unknown repo", StatusCode::NOT_FOUND))?;
+        let default = Store::queue_config(&self.db, default_id)
+            .await
+            .map_err(Self::db_err)?;
+        let default_base = default.base_branch.clone();
+        let base_branch = body.0.base_branch.unwrap_or(default.base_branch);
+        let batch_size = body.0.batch_size.unwrap_or(default.batch_size as i32);
+        if batch_size <= 0 {
+            return Err(Error::from_string(
+                "batch size must be a positive integer",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ));
+        }
+        let required_checks = if base_branch == default_base {
+            default.required_checks
+        } else {
+            self.rt
+                .required_checks(repo_id, &base_branch)
+                .await
+                .unwrap_or_default()
+        };
+        let queue_id = Store::create_queue(
+            &self.db,
+            repo_id,
+            &name,
+            &base_branch,
+            batch_size,
+            default.merge_method,
+            &default.staging_prefix,
+            &required_checks,
+        )
+        .await
+        .map_err(Self::db_err)?;
+        let summaries = Store::list_queues(&self.db, repo_id)
+            .await
+            .map_err(Self::db_err)?;
+        let view = summaries
+            .into_iter()
+            .find(|s| s.id == queue_id)
+            .map(QueueView::from)
+            .ok_or_else(|| {
+                Error::from_string("queue vanished", StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
+        Ok(Json(view))
+    }
+
+    /// A queue's open entries, projected against its active batch (the train view).
+    #[oai(path = "/queues/:queue_id", method = "get")]
+    async fn get_queue(
+        &self,
+        queue_id: Path<String>,
+        #[oai(name = "mq_session")] session: Cookie<Option<String>>,
+    ) -> Result<Json<Vec<EntryView>>> {
+        let queue_id = Self::parse_queue(&queue_id.0)?;
+        self.authorize_queue(&session, queue_id).await?;
+        let entries = Store::list_entries(&self.db, queue_id)
+            .await
+            .map_err(Self::db_err)?;
+        let batch = Store::active_batch_view(&self.db, queue_id)
             .await
             .map_err(Self::db_err)?;
         let views = entries
@@ -412,43 +642,43 @@ impl Api {
         Ok(Json(views))
     }
 
-    /// Recent finished batch runs for a repo, newest first (the dashboard's history
-    /// view). `limit` defaults to 50 and is capped at 200.
-    #[oai(path = "/repos/:repo_id/ledger", method = "get")]
+    /// Recent finished batch runs for a queue, newest first (the history view).
+    /// `limit` defaults to 50 and is capped at 200.
+    #[oai(path = "/queues/:queue_id/ledger", method = "get")]
     async fn get_ledger(
         &self,
-        repo_id: Path<String>,
+        queue_id: Path<String>,
         limit: Query<Option<u64>>,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<Vec<LedgerView>>> {
-        self.require_session(&session).await?;
-        let repo_id = Self::parse_repo(&repo_id.0)?;
+        let queue_id = Self::parse_queue(&queue_id.0)?;
+        self.authorize_queue(&session, queue_id).await?;
         let limit = limit.0.unwrap_or(50).min(200);
-        let rows = Store::list_ledger(&self.db, repo_id, limit)
+        let rows = Store::list_ledger(&self.db, queue_id, limit)
             .await
             .map_err(Self::db_err)?;
         Ok(Json(rows.into_iter().map(LedgerView::project).collect()))
     }
 
-    /// Add a PR to the queue. Validates the PR's base matches the queue before
-    /// accepting it (a PR into another branch is rejected, not merged into base).
-    #[oai(path = "/repos/:repo_id/queue", method = "post")]
+    /// Add a PR to a queue. Validates the PR's base matches the queue, and that the
+    /// PR isn't already open in another queue of the repo, before accepting it.
+    #[oai(path = "/queues/:queue_id/enqueue", method = "post")]
     async fn enqueue(
         &self,
-        repo_id: Path<String>,
+        queue_id: Path<String>,
         body: Json<EnqueueRequest>,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<EntryView>> {
-        let by = self.require_session(&session).await?;
-        let repo_id = Self::parse_repo(&repo_id.0)?;
+        let queue_id = Self::parse_queue(&queue_id.0)?;
+        let by = self.authorize_queue(&session, queue_id).await?;
         match self
             .rt
-            .enqueue_pr(repo_id, body.0.pr_number as u64, &by)
+            .enqueue_pr(queue_id, body.0.pr_number as u64, &by)
             .await
             .map_err(Self::enqueue_err)?
         {
             Enqueued::Ok { entry, .. } => {
-                let batch = Store::active_batch_view(&self.db, repo_id)
+                let batch = Store::active_batch_view(&self.db, queue_id)
                     .await
                     .map_err(Self::db_err)?;
                 Ok(Json(EntryView::project(entry, batch.as_ref())))
@@ -460,31 +690,39 @@ impl Api {
                 format!("this PR targets {pr_base}, but the queue lands into {queue_base}"),
                 StatusCode::UNPROCESSABLE_ENTITY,
             )),
+            Enqueued::AlreadyQueued { queue } => Err(Error::from_string(
+                format!("this PR is already open in the `{queue}` queue; remove it there first"),
+                StatusCode::CONFLICT,
+            )),
         }
     }
 
-    /// Remove a PR from the train. Works whether it's queued or already testing in
-    /// the active batch — a testing PR cancels its batch and re-queues the rest.
-    #[oai(path = "/repos/:repo_id/queue/:entry_id", method = "delete")]
+    /// Remove a PR from a queue. Works whether it's queued or already testing in the
+    /// active batch — a testing PR cancels its batch and re-queues the rest. The entry
+    /// id is globally unique; its queue is resolved from the entry itself.
+    #[oai(path = "/queues/:queue_id/entries/:entry_id", method = "delete")]
     async fn dequeue(
         &self,
-        repo_id: Path<String>,
+        queue_id: Path<String>,
         entry_id: Path<String>,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<Health>> {
-        self.require_session(&session).await?;
-        let repo_id = Self::parse_repo(&repo_id.0)?;
-        let entry_id = Self::parse_repo(&entry_id.0)?;
-        match self
-            .rt
-            .force_dequeue(repo_id, entry_id)
+        let queue_id = Self::parse_queue(&queue_id.0)?;
+        self.authorize_queue(&session, queue_id).await?;
+        let entry_id = Self::parse_queue(&entry_id.0)?;
+        if let Some(entry) = Store::entry(&self.db, entry_id)
             .await
-            .map_err(|_| {
-                Error::from_string(
-                    "could not remove this PR",
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                )
-            })? {
+            .map_err(Self::db_err)?
+            && entry.queue_id != queue_id
+        {
+            return Err(Error::from_string("unknown entry", StatusCode::NOT_FOUND));
+        }
+        match self.rt.force_dequeue(entry_id).await.map_err(|_| {
+            Error::from_string(
+                "could not remove this PR",
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+        })? {
             Removed::Busy { .. } => Err(Error::from_string(
                 "can't remove — the batch is merging; try again in a moment",
                 StatusCode::CONFLICT,
@@ -495,17 +733,17 @@ impl Api {
         }
     }
 
-    /// Reorder the queued entries (drag-to-reorder the train). Only `queued`
+    /// Reorder a queue's queued entries (drag-to-reorder the train). Only `queued`
     /// entries move; an entry already testing in the active batch keeps its slot.
-    #[oai(path = "/repos/:repo_id/queue/order", method = "put")]
+    #[oai(path = "/queues/:queue_id/order", method = "put")]
     async fn reorder(
         &self,
-        repo_id: Path<String>,
+        queue_id: Path<String>,
         body: Json<ReorderRequest>,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<Vec<EntryView>>> {
-        self.require_session(&session).await?;
-        let repo_id = Self::parse_repo(&repo_id.0)?;
+        let queue_id = Self::parse_queue(&queue_id.0)?;
+        self.authorize_queue(&session, queue_id).await?;
         let mut ids = Vec::with_capacity(body.0.entry_ids.len());
         for raw in &body.0.entry_ids {
             ids.push(
@@ -514,14 +752,14 @@ impl Api {
             );
         }
         let txn = self.db.begin().await.map_err(Self::db_err)?;
-        Store::reorder(&txn, repo_id, &ids)
+        Store::reorder(&txn, queue_id, &ids)
             .await
             .map_err(Self::db_err)?;
         txn.commit().await.map_err(Self::db_err)?;
-        let entries = Store::list_entries(&self.db, repo_id)
+        let entries = Store::list_entries(&self.db, queue_id)
             .await
             .map_err(Self::db_err)?;
-        let batch = Store::active_batch_view(&self.db, repo_id)
+        let batch = Store::active_batch_view(&self.db, queue_id)
             .await
             .map_err(Self::db_err)?;
         let views = entries
@@ -532,17 +770,19 @@ impl Api {
     }
 
     // TODO:
-    //   GET /repos/:repo_id/batches            → active + recent batch history
+    //   GET /queues/:queue_id/batches          → active + recent batch history
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, LazyLock};
 
+    use async_trait::async_trait;
     use chrono::{DateTime, Duration, Utc};
     use migration::{Migrator, MigratorTrait};
     use poem::http::StatusCode;
     use poem_openapi::param::{Cookie, Path, Query};
+    use poem_openapi::payload::Json;
     use sea_orm::{
         ActiveModelTrait, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Set,
         Statement,
@@ -551,12 +791,114 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
-    use super::Api;
+    use super::{Api, CreateQueueRequest};
     use crate::auth;
     use crate::config::{Config, DatabaseConfig, ServerConfig};
+    use crate::github::{
+        CheckState, GitHubError, MergeOutcome, PullSummary, RepoClient, RepoId, RepoPermission,
+    };
     use crate::queue::LedgerOutcome;
     use crate::runtime::Runtime;
     use crate::store::{Store, queue_ledger};
+
+    /// A minimal `RepoClient` for API authz tests: it answers `user_permission` with a
+    /// fixed level and `required_checks` with a fixed set; everything else is inert.
+    struct FakeRepo {
+        permission: RepoPermission,
+        required: Vec<String>,
+    }
+
+    impl FakeRepo {
+        fn new(permission: RepoPermission) -> Self {
+            Self {
+                permission,
+                required: vec![],
+            }
+        }
+
+        fn with_required(mut self, required: &[&str]) -> Self {
+            self.required = required.iter().map(|s| s.to_string()).collect();
+            self
+        }
+    }
+
+    #[async_trait]
+    impl RepoClient for FakeRepo {
+        async fn list_open_pulls(&self, _: &RepoId) -> Result<Vec<PullSummary>, GitHubError> {
+            Ok(vec![])
+        }
+        async fn base_sha(&self, _: &RepoId, _: &str) -> Result<String, GitHubError> {
+            Ok(String::new())
+        }
+        async fn pull(&self, _: &RepoId, pr: u64) -> Result<PullSummary, GitHubError> {
+            Ok(PullSummary {
+                number: pr,
+                title: String::new(),
+                head_sha: format!("head{pr}"),
+                head_ref: format!("feature-{pr}"),
+                base_ref: "main".into(),
+                mergeable: Some(true),
+                approved: false,
+            })
+        }
+        async fn merge_onto(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<MergeOutcome, GitHubError> {
+            Ok(MergeOutcome::Merged)
+        }
+        async fn force_ref(&self, _: &RepoId, _: &str, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn delete_ref(&self, _: &RepoId, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn check_state(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &[String],
+        ) -> Result<CheckState, GitHubError> {
+            Ok(CheckState::Pending)
+        }
+        async fn reported_contexts(&self, _: &RepoId, _: &str) -> Result<Vec<String>, GitHubError> {
+            Ok(vec![])
+        }
+        async fn fast_forward(&self, _: &RepoId, _: &str, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn comment(&self, _: &RepoId, _: u64, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn ensure_label(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn add_labels(&self, _: &RepoId, _: u64, _: &[String]) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn remove_label(&self, _: &RepoId, _: u64, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn user_permission(
+            &self,
+            _: &RepoId,
+            _: &str,
+        ) -> Result<RepoPermission, GitHubError> {
+            Ok(self.permission)
+        }
+        async fn required_checks(&self, _: &RepoId, _: &str) -> Result<Vec<String>, GitHubError> {
+            Ok(self.required.clone())
+        }
+    }
 
     /// Serializes DB tests against the shared test database.
     static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
@@ -578,8 +920,8 @@ mod tests {
         Migrator::up(&db, None).await.expect("migrate test db");
         db.execute(Statement::from_string(
             DatabaseBackend::Postgres,
-            "TRUNCATE queue_ledger, batch_entries, batches, queue_entries, sessions, users, repos, \
-             installations CASCADE",
+            "TRUNCATE queue_ledger, batch_entries, batches, queue_entries, queues, sessions, \
+             users, repos, installations CASCADE",
         ))
         .await
         .unwrap();
@@ -603,13 +945,26 @@ mod tests {
         Api { cfg, db, rt }
     }
 
-    async fn seed_repo(db: &DatabaseConnection) -> Uuid {
+    /// An `Api` with `client` installed so the write-authz gate (and branch-protection
+    /// reads) resolve against it instead of an unconfigured App.
+    async fn api_with_client(db: DatabaseConnection, client: FakeRepo) -> Api {
+        let api = test_api(db);
+        api.rt.install_test_repo_client(Arc::new(client)).await;
+        api
+    }
+
+    async fn seed_repo(db: &DatabaseConnection) -> (Uuid, Uuid) {
         Store::provision_installation(db, 88, "acme").await.unwrap();
         Store::upsert_repo(db, 88, "acme", "widgets").await.unwrap();
-        Store::repo_id_by_name(db, "acme", "widgets")
+        let repo_id = Store::repo_id_by_name(db, "acme", "widgets")
             .await
             .unwrap()
+            .unwrap();
+        let queue_id = Store::queue_id_by_name(db, repo_id, "default")
+            .await
             .unwrap()
+            .unwrap();
+        (repo_id, queue_id)
     }
 
     async fn seed_session(db: &DatabaseConnection) -> Uuid {
@@ -639,12 +994,14 @@ mod tests {
     async fn insert_ledger(
         db: &DatabaseConnection,
         repo_id: Uuid,
+        queue_id: Uuid,
         ended_at: DateTime<Utc>,
     ) -> Uuid {
         let id = Uuid::new_v4();
         queue_ledger::ActiveModel {
             id: Set(id),
             repo_id: Set(repo_id),
+            queue_id: Set(queue_id),
             batch_id: Set(Uuid::new_v4()),
             outcome: Set(LedgerOutcome::Merged),
             base_sha: Set("base000".into()),
@@ -664,16 +1021,16 @@ mod tests {
     async fn test_api_ledger_returns_rows_newest_first_for_session() {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
-        let api = test_api(db.clone());
-        let repo_id = seed_repo(&db).await;
+        let api = api_with_client(db.clone(), FakeRepo::new(RepoPermission::Write)).await;
+        let (repo_id, queue_id) = seed_repo(&db).await;
         let sid = seed_session(&db).await;
         let base = Utc::now();
-        let older = insert_ledger(&db, repo_id, base).await;
-        let newer = insert_ledger(&db, repo_id, base + Duration::seconds(5)).await;
+        let older = insert_ledger(&db, repo_id, queue_id, base).await;
+        let newer = insert_ledger(&db, repo_id, queue_id, base + Duration::seconds(5)).await;
 
         let views = api
             .get_ledger(
-                Path(repo_id.to_string()),
+                Path(queue_id.to_string()),
                 Query(None),
                 Cookie(Some(sid.to_string())),
             )
@@ -692,13 +1049,155 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let api = test_api(db.clone());
-        let repo_id = seed_repo(&db).await;
+        let (_repo_id, queue_id) = seed_repo(&db).await;
 
         let err = api
-            .get_ledger(Path(repo_id.to_string()), Query(None), Cookie(None))
+            .get_ledger(Path(queue_id.to_string()), Query(None), Cookie(None))
             .await
             .err()
             .expect("a missing session must be rejected");
         assert_eq!(err.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_api_queue_route_forbids_non_writer() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = api_with_client(db.clone(), FakeRepo::new(RepoPermission::Read)).await;
+        let (repo_id, queue_id) = seed_repo(&db).await;
+        let sid = seed_session(&db).await;
+        let base = Utc::now();
+        insert_ledger(&db, repo_id, queue_id, base).await;
+
+        let err = api
+            .get_ledger(
+                Path(queue_id.to_string()),
+                Query(None),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .err()
+            .expect("a read-only user must not read a queue they can't write");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_api_create_queue_forbids_non_writer() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = api_with_client(db.clone(), FakeRepo::new(RepoPermission::Read)).await;
+        let (repo_id, _queue_id) = seed_repo(&db).await;
+        let sid = seed_session(&db).await;
+
+        let err = api
+            .create_queue(
+                Path(repo_id.to_string()),
+                Json(CreateQueueRequest {
+                    name: "frontend".into(),
+                    base_branch: None,
+                    batch_size: None,
+                }),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .err()
+            .expect("a read-only user must not create a queue");
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_api_create_queue_rejects_duplicate_name() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = api_with_client(db.clone(), FakeRepo::new(RepoPermission::Write)).await;
+        let (repo_id, _queue_id) = seed_repo(&db).await;
+        let sid = seed_session(&db).await;
+        let req = || {
+            Json(CreateQueueRequest {
+                name: "frontend".into(),
+                base_branch: None,
+                batch_size: Some(2),
+            })
+        };
+
+        api.create_queue(
+            Path(repo_id.to_string()),
+            req(),
+            Cookie(Some(sid.to_string())),
+        )
+        .await
+        .expect("the first create succeeds");
+
+        let err = api
+            .create_queue(
+                Path(repo_id.to_string()),
+                req(),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .err()
+            .expect("a duplicate queue name must be rejected, not silently absorbed");
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_api_create_queue_seeds_required_checks_from_new_base() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        let api = api_with_client(
+            db.clone(),
+            FakeRepo::new(RepoPermission::Write).with_required(&["release-ci"]),
+        )
+        .await;
+        let (repo_id, default_id) = seed_repo(&db).await;
+        let sid = seed_session(&db).await;
+        Store::set_queue_required_checks(&db, default_id, &["ci".to_string()])
+            .await
+            .unwrap();
+
+        let same = api
+            .create_queue(
+                Path(repo_id.to_string()),
+                Json(CreateQueueRequest {
+                    name: "same".into(),
+                    base_branch: None,
+                    batch_size: None,
+                }),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .unwrap()
+            .0;
+        let same_cfg = Store::queue_config(&db, Uuid::parse_str(&same.id).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            same_cfg.required_checks,
+            vec!["ci".to_string()],
+            "a queue on the default base clones the default queue's checks"
+        );
+
+        let diff = api
+            .create_queue(
+                Path(repo_id.to_string()),
+                Json(CreateQueueRequest {
+                    name: "rel".into(),
+                    base_branch: Some("release".into()),
+                    batch_size: None,
+                }),
+                Cookie(Some(sid.to_string())),
+            )
+            .await
+            .unwrap()
+            .0;
+        let diff_cfg = Store::queue_config(&db, Uuid::parse_str(&diff.id).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            diff_cfg.required_checks,
+            vec!["release-ci".to_string()],
+            "a queue on a different base seeds checks from that base's branch protection"
+        );
+        assert_eq!(diff_cfg.base_branch, "release");
     }
 }

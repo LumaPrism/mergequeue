@@ -102,13 +102,32 @@ impl Runtime {
     }
 
     /// Whether `username` has write (or admin) access to the repo — the authz gate
-    /// for PR-comment queue commands. `false` when the App isn't configured.
+    /// for PR-comment queue commands and the dashboard's queue mutations. `false`
+    /// when the App isn't configured.
     pub async fn can_write(&self, repo_id: Uuid, username: &str) -> Result<bool> {
         let Some(client) = self.repo_client.read().await.clone() else {
             return Ok(false);
         };
         let gh = Store::repo_ref(&self.db, repo_id).await?;
         Ok(client.user_permission(&gh, username).await?.can_write())
+    }
+
+    /// The required status-check contexts on `branch`'s protection, read live from
+    /// GitHub — used to seed a new queue whose base differs from the repo's default
+    /// queue. Empty when the App isn't configured yet.
+    pub async fn required_checks(&self, repo_id: Uuid, branch: &str) -> Result<Vec<String>> {
+        let Some(client) = self.repo_client.read().await.clone() else {
+            return Ok(vec![]);
+        };
+        let gh = Store::repo_ref(&self.db, repo_id).await?;
+        Ok(client.required_checks(&gh, branch).await?)
+    }
+
+    /// Test seam: install just the repo client so API authz and branch-protection
+    /// reads can be exercised without the full `/setup` credential flow.
+    #[cfg(test)]
+    pub async fn install_test_repo_client(&self, client: Arc<dyn RepoClient>) {
+        *self.repo_client.write().await = Some(client);
     }
 
     /// Post a comment on a PR (the PR-comment command's reply). No-op when the App
@@ -122,14 +141,15 @@ impl Runtime {
         Ok(())
     }
 
-    /// Validate and enqueue a PR — the single enqueue path for both the dashboard
-    /// API and the `/mergequeue queue` PR-comment command. Fetches the PR live to
-    /// reject one whose base doesn't match the queue (a backport/release PR must
-    /// never be merged into the wrong base), then assigns its queue position under a
-    /// per-repo advisory lock so concurrent enqueues can't collide on order.
-    pub async fn enqueue_pr(&self, repo_id: Uuid, pr: u64, by: &str) -> Result<Enqueued> {
-        let cfg = Store::repo_config(&self.db, repo_id).await?;
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
+    /// Validate and enqueue a PR into a specific queue — the single enqueue path for
+    /// both the dashboard API and the `/mq queue` PR-comment command. Fetches the PR
+    /// live to reject one whose base doesn't match the queue (a backport/release PR
+    /// must never be merged into the wrong base), enforces the repo-wide PR-open guard
+    /// (a PR is open in at most one queue per repo), then assigns its queue position
+    /// under a per-queue advisory lock so concurrent enqueues can't collide on order.
+    pub async fn enqueue_pr(&self, queue_id: Uuid, pr: u64, by: &str) -> Result<Enqueued> {
+        let cfg = Store::queue_config(&self.db, queue_id).await?;
+        let gh = Store::repo_ref(&self.db, cfg.repo_id).await?;
         let Some(client) = self.repo_client.read().await.clone() else {
             return Err(GitHubError::Other("github app not configured".into()).into());
         };
@@ -140,8 +160,14 @@ impl Runtime {
                 queue_base: cfg.base_branch,
             });
         }
+        if let Some(existing) = Store::open_entry(&self.db, cfg.repo_id, pr).await?
+            && existing.queue_id != queue_id
+        {
+            let other = Store::queue_config(&self.db, existing.queue_id).await?;
+            return Ok(Enqueued::AlreadyQueued { queue: other.name });
+        }
         let txn = self.db.begin().await?;
-        let bytes = repo_id.as_bytes();
+        let bytes = cfg.repo_id.as_bytes();
         let key = i64::from_le_bytes(bytes[..8].try_into().unwrap())
             ^ i64::from_le_bytes(bytes[8..].try_into().unwrap());
         txn.execute(Statement::from_sql_and_values(
@@ -150,15 +176,24 @@ impl Runtime {
             [Value::from(key)],
         ))
         .await?;
-        let entry = Store::enqueue(&txn, repo_id, pr, &summary.head_sha, by).await?;
-        let position = Store::queue_rank(&txn, repo_id, entry.position).await? as i32;
+        if let Some(existing) = Store::open_entry(&txn, cfg.repo_id, pr).await?
+            && existing.queue_id != queue_id
+        {
+            let other = Store::queue_config(&self.db, existing.queue_id).await?;
+            return Ok(Enqueued::AlreadyQueued { queue: other.name });
+        }
+        let entry = Store::enqueue(&txn, cfg.repo_id, queue_id, pr, &summary.head_sha, by).await?;
+        let position = Store::queue_rank(&txn, queue_id, entry.position).await? as i32;
         txn.commit().await?;
         let warn_no_checks = cfg.required_checks.is_empty();
-        let mut comment = format!("**mergequeue** · queued · position {position}");
+        let mut comment = format!(
+            "**mergequeue** · queued · queue `{}` · position {position}",
+            cfg.name
+        );
         if warn_no_checks {
             comment.push_str(" · ⚠️ no required checks configured (held)");
         }
-        let _ = self.comment(repo_id, pr, &comment).await;
+        let _ = self.comment(cfg.repo_id, pr, &comment).await;
         let _ = client
             .set_train_label(&gh, pr, Some(TrainLabel::Queued))
             .await;
@@ -192,18 +227,21 @@ impl Runtime {
     /// fast-forwarded base to the staging tip: those PRs are effectively landed and
     /// must not be yanked, so that's reported as `Busy` (also when we can't confirm,
     /// to fail safe).
-    pub async fn force_dequeue(&self, repo_id: Uuid, entry_id: Uuid) -> Result<Removed> {
-        let Some(pr) = Store::entry_pr_number(&self.db, entry_id).await? else {
+    pub async fn force_dequeue(&self, entry_id: Uuid) -> Result<Removed> {
+        let Some(entry) = Store::entry(&self.db, entry_id).await? else {
             return Ok(Removed::NotQueued);
         };
-        match Store::open_entry_state(&self.db, repo_id, pr).await? {
-            Some(EntryState::Queued) => {
-                if !Store::dequeue(&self.db, repo_id, entry_id).await? {
+        let repo_id = entry.repo_id;
+        let queue_id = entry.queue_id;
+        let pr = entry.pr_number;
+        match entry.state {
+            EntryState::Queued => {
+                if !Store::dequeue(&self.db, queue_id, entry_id).await? {
                     return Ok(Removed::NotQueued);
                 }
             }
-            Some(EntryState::Testing) => {
-                let Some(batch) = Store::active_batch_view(&self.db, repo_id).await? else {
+            EntryState::Testing => {
+                let Some(batch) = Store::active_batch_view(&self.db, queue_id).await? else {
                     return Ok(Removed::NotQueued);
                 };
                 let entry_ids = batch.entry_ids();
@@ -214,7 +252,7 @@ impl Runtime {
                     let staging_sha = batch.staging_sha.clone().unwrap_or_default();
                     let landed = match self.repo_client.read().await.clone() {
                         Some(client) => {
-                            let cfg = Store::repo_config(&self.db, repo_id).await?;
+                            let cfg = Store::queue_config(&self.db, queue_id).await?;
                             let gh = Store::repo_ref(&self.db, repo_id).await?;
                             client
                                 .base_sha(&gh, &cfg.base_branch)
@@ -239,7 +277,7 @@ impl Runtime {
                     let _ = client.delete_ref(&gh, &batch.assembly_ref()).await;
                 }
                 let txn = self.db.begin().await?;
-                Store::remove_entry(&txn, repo_id, entry_id).await?;
+                Store::remove_entry(&txn, queue_id, entry_id).await?;
                 Store::requeue_entries(&txn, &others).await?;
                 Store::set_batch_state(&txn, batch.id, BatchState::Superseded).await?;
                 Store::append_ledger(&txn, &LedgerRecord::removed(&batch, pr)).await?;
@@ -253,7 +291,7 @@ impl Runtime {
                         .await;
                 }
             }
-            Some(EntryState::Merged) | Some(EntryState::Ejected) | None => {
+            EntryState::Merged | EntryState::Ejected => {
                 return Ok(Removed::NotQueued);
             }
         }
@@ -309,30 +347,17 @@ impl Runtime {
                 else {
                     continue;
                 };
-                // Track the repo's GitHub default branch as the queue base, and mirror
-                // its branch-protection required checks so the engine gates on the
-                // repo's *real* required checks (an empty set holds the queue — that's
-                // the safety guard, not a misconfiguration). Only overwrite the checks
-                // on a successful read, so a transient API error never wipes them.
-                Store::set_base_branch(&self.db, repo_id, &repo.default_branch).await?;
+                let default_queue =
+                    Store::get_or_create_queue(&self.db, repo_id, "default").await?;
+                Store::set_queue_base_branch(&self.db, default_queue, &repo.default_branch).await?;
                 if let Some(client) = &repo_client {
                     let gh = RepoId {
                         owner: repo.owner.login.clone(),
                         name: repo.name.clone(),
                         installation_id: inst.id as u64,
                     };
-                    match client.required_checks(&gh, &repo.default_branch).await {
-                        Ok(checks) => {
-                            Store::set_required_checks(&self.db, repo_id, &checks).await?;
-                        }
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            repo = %format!("{}/{}", repo.owner.login, repo.name),
-                            "could not read branch protection — grant the App \
-                             administration:read and re-approve the install; required checks \
-                             left unchanged (the repo stays held if it has none yet)"
-                        ),
-                    }
+                    Self::reconcile_required_checks(&self.db, client.as_ref(), &gh, repo_id)
+                        .await?;
                 }
             }
             // drop repos this installation no longer grants access to.
@@ -340,6 +365,34 @@ impl Runtime {
         }
         // drop installations the App was removed from (cascades their repos).
         Store::prune_installations(&self.db, &keep_installations, snapshot).await?;
+        Ok(())
+    }
+
+    /// Reconcile EVERY one of a repo's queues' required checks against ITS OWN base
+    /// branch's protection — not just the default queue. The default queue tracks the
+    /// repo's GitHub default branch (set by the caller); operator-created named queues
+    /// keep their own base. Only overwrite on a successful read, so a transient API
+    /// error never wipes a queue's checks — an empty set holds the queue (the safety
+    /// guard, not a misconfiguration).
+    async fn reconcile_required_checks(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        gh: &RepoId,
+        repo_id: Uuid,
+    ) -> Result<()> {
+        for q in Store::list_queues(db, repo_id).await? {
+            match client.required_checks(gh, &q.base_branch).await {
+                Ok(checks) => Store::set_queue_required_checks(db, q.id, &checks).await?,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    repo = %format!("{}/{}", gh.owner, gh.name),
+                    branch = %q.base_branch,
+                    "could not read branch protection — grant the App administration:read \
+                     and re-approve the install; required checks left unchanged (the queue \
+                     stays held if it has none yet)"
+                ),
+            }
+        }
         Ok(())
     }
 
@@ -395,8 +448,11 @@ pub enum Enqueued {
         /// guard) — surface a warning to whoever queued it.
         warn_no_checks: bool,
     },
-    /// The PR targets a branch other than this repo's queue base; not enqueued.
+    /// The PR targets a branch other than this queue's base; not enqueued.
     WrongBase { pr_base: String, queue_base: String },
+    /// The PR is already open in another queue of the repo (the repo-wide PR-open
+    /// guard); pick that queue or remove it there first.
+    AlreadyQueued { queue: String },
 }
 
 /// Outcome of a force-dequeue, shared by the dashboard API and the PR-comment
@@ -459,5 +515,199 @@ impl Pagination {
             per_page: Self::PER_PAGE,
             page,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::LazyLock;
+
+    use async_trait::async_trait;
+    use migration::{Migrator, MigratorTrait};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    use super::Runtime;
+    use crate::github::{
+        CheckState, GitHubError, MergeOutcome, PullSummary, RepoClient, RepoId, RepoPermission,
+    };
+    use crate::store::Store;
+
+    /// Serializes DB tests against the shared test database.
+    static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+    /// A `RepoClient` whose `required_checks` answer is keyed by branch, so a per-queue
+    /// reconcile can be asserted to read each queue's OWN base branch.
+    struct BranchChecks {
+        by_branch: HashMap<String, Vec<String>>,
+    }
+
+    #[async_trait]
+    impl RepoClient for BranchChecks {
+        async fn required_checks(
+            &self,
+            _: &RepoId,
+            branch: &str,
+        ) -> Result<Vec<String>, GitHubError> {
+            Ok(self.by_branch.get(branch).cloned().unwrap_or_default())
+        }
+        async fn list_open_pulls(&self, _: &RepoId) -> Result<Vec<PullSummary>, GitHubError> {
+            Ok(vec![])
+        }
+        async fn base_sha(&self, _: &RepoId, _: &str) -> Result<String, GitHubError> {
+            Ok(String::new())
+        }
+        async fn pull(&self, _: &RepoId, pr: u64) -> Result<PullSummary, GitHubError> {
+            Ok(PullSummary {
+                number: pr,
+                title: String::new(),
+                head_sha: String::new(),
+                head_ref: String::new(),
+                base_ref: "main".into(),
+                mergeable: Some(true),
+                approved: false,
+            })
+        }
+        async fn merge_onto(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<MergeOutcome, GitHubError> {
+            Ok(MergeOutcome::Merged)
+        }
+        async fn force_ref(&self, _: &RepoId, _: &str, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn delete_ref(&self, _: &RepoId, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn check_state(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &[String],
+        ) -> Result<CheckState, GitHubError> {
+            Ok(CheckState::Pending)
+        }
+        async fn reported_contexts(&self, _: &RepoId, _: &str) -> Result<Vec<String>, GitHubError> {
+            Ok(vec![])
+        }
+        async fn fast_forward(&self, _: &RepoId, _: &str, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn comment(&self, _: &RepoId, _: u64, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn ensure_label(
+            &self,
+            _: &RepoId,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn add_labels(&self, _: &RepoId, _: u64, _: &[String]) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn remove_label(&self, _: &RepoId, _: u64, _: &str) -> Result<(), GitHubError> {
+            Ok(())
+        }
+        async fn user_permission(
+            &self,
+            _: &RepoId,
+            _: &str,
+        ) -> Result<RepoPermission, GitHubError> {
+            Ok(RepoPermission::Write)
+        }
+    }
+
+    async fn test_db() -> DatabaseConnection {
+        let url = std::env::var("MQ_TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@localhost:5433/mergequeue_test".into()
+        });
+        let (host, _) = url.rsplit_once('/').expect("db url has a path");
+        if let Ok(maint) = Database::connect(format!("{host}/postgres")).await {
+            let _ = maint
+                .execute(Statement::from_string(
+                    DatabaseBackend::Postgres,
+                    "CREATE DATABASE mergequeue_test",
+                ))
+                .await;
+        }
+        let db = Database::connect(&url).await.expect("connect test db");
+        Migrator::up(&db, None).await.expect("migrate test db");
+        db.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "TRUNCATE queue_ledger, batch_entries, batches, queue_entries, queues, repos, \
+             installations CASCADE",
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn test_runtime_reconcile_uses_each_queues_own_base() {
+        let _guard = DB_LOCK.lock().await;
+        let db = test_db().await;
+        Store::provision_installation(&db, 91, "acme")
+            .await
+            .unwrap();
+        Store::upsert_repo(&db, 91, "acme", "widgets")
+            .await
+            .unwrap();
+        let repo_id = Store::repo_id_by_name(&db, "acme", "widgets")
+            .await
+            .unwrap()
+            .unwrap();
+        let default_id = Store::queue_id_by_name(&db, repo_id, "default")
+            .await
+            .unwrap()
+            .unwrap();
+        Store::set_queue_base_branch(&db, default_id, "main")
+            .await
+            .unwrap();
+        let rel_id = Store::get_or_create_queue(&db, repo_id, "release")
+            .await
+            .unwrap();
+        Store::set_queue_base_branch(&db, rel_id, "release")
+            .await
+            .unwrap();
+
+        let fake = BranchChecks {
+            by_branch: HashMap::from([
+                ("main".to_string(), vec!["ci".to_string()]),
+                ("release".to_string(), vec!["release-ci".to_string()]),
+            ]),
+        };
+        let gh = RepoId {
+            owner: "acme".into(),
+            name: "widgets".into(),
+            installation_id: 91,
+        };
+        Runtime::reconcile_required_checks(&db, &fake, &gh, repo_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            Store::queue_config(&db, default_id)
+                .await
+                .unwrap()
+                .required_checks,
+            vec!["ci".to_string()],
+            "the default queue reconciles against main"
+        );
+        assert_eq!(
+            Store::queue_config(&db, rel_id)
+                .await
+                .unwrap()
+                .required_checks,
+            vec!["release-ci".to_string()],
+            "a named queue reconciles against ITS OWN base, not the repo default"
+        );
     }
 }

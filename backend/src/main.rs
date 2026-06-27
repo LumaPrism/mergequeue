@@ -75,17 +75,17 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(error = %e, "worker: installation sync failed");
                 }
                 n = n.wrapping_add(1);
-                let repos = match store::Store::active_repo_ids(&rt.db()).await {
+                let queues = match store::Store::active_queue_ids(&rt.db()).await {
                     Ok(ids) => ids,
                     Err(e) => {
-                        tracing::warn!(error = %e, "worker: listing repos failed");
+                        tracing::warn!(error = %e, "worker: listing queues failed");
                         continue;
                     }
                 };
-                // Sequential per-repo ticks — one FSM step each, serialized.
-                for id in repos {
-                    if let Err(e) = engine.tick(id).await {
-                        tracing::warn!(error = %e, %id, "worker: repo tick failed");
+                // Sequential per-queue ticks — one FSM step each, serialized.
+                for (queue_id, repo_id) in queues {
+                    if let Err(e) = engine.tick(queue_id).await {
+                        tracing::warn!(error = %e, %queue_id, %repo_id, "worker: queue tick failed");
                     }
                 }
             }

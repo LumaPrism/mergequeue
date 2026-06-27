@@ -64,17 +64,20 @@ impl RelevantEvent {
 }
 
 /// A queue command parsed from a PR comment body. Written on its own line as
-/// `/mergequeue queue`, `/mq queue`, or the bare `/queue` (likewise `dequeue`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `/mergequeue queue [<name>]`, `/mq queue [<name>]`, or the bare `/queue [<name>]`
+/// (likewise `dequeue`). `queue` takes an optional queue name (default `default`);
+/// `dequeue` resolves the PR's current queue, so it takes no name.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
-    Queue,
+    Queue { queue: Option<String> },
     Dequeue,
 }
 
 impl Command {
     /// First command found across the comment's lines, or `None`. A command must
     /// lead its line — `/mergequeue <verb>`, `/mq <verb>`, or the bare `/<verb>` —
-    /// and lines inside fenced code blocks (``` or ~~~) are ignored.
+    /// and lines inside fenced code blocks (``` or ~~~) are ignored. The token after
+    /// `queue` is captured as the optional target queue name.
     fn parse(body: &str) -> Option<Self> {
         let mut in_fence = false;
         for line in body.lines() {
@@ -97,12 +100,28 @@ impl Command {
                 _ => continue,
             };
             match verb {
-                "queue" => return Some(Self::Queue),
+                "queue" => {
+                    return Some(Self::Queue {
+                        queue: tok.next().map(str::to_string),
+                    });
+                }
                 "dequeue" | "unqueue" => return Some(Self::Dequeue),
                 _ => continue,
             }
         }
         None
+    }
+
+    /// A queue name is ref-safe iff it matches `^[a-z0-9][a-z0-9-]*$` — it's folded
+    /// directly into the staging ref.
+    fn name_is_ref_safe(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+            _ => return false,
+        }
+        name.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     }
 }
 
@@ -279,7 +298,7 @@ impl Webhook {
         // GitHub delivers issue_comment for closed PRs too — never queue a closed PR
         // (its head must not be merged into base).
         if ev.issue.state != "open" {
-            if matches!(cmd, Command::Queue) {
+            if matches!(cmd, Command::Queue { .. }) {
                 let _ = self
                     .rt
                     .comment(
@@ -293,25 +312,56 @@ impl Webhook {
         }
 
         match cmd {
-            Command::Queue => match self.rt.enqueue_pr(repo_id, pr, actor).await {
-                // enqueue_pr already comments on the PR ("added to the train"), so
-                // there's nothing more to say here.
-                Ok(Enqueued::Ok { .. }) => {}
-                Ok(Enqueued::WrongBase {
-                    pr_base,
-                    queue_base,
-                }) => {
-                    let msg = format!(
-                        "⚠️ #{pr} targets `{pr_base}`, but this queue lands into `{queue_base}`. \
-                         Only PRs into `{queue_base}` can be queued."
-                    );
-                    let _ = self.rt.comment(repo_id, pr, &msg).await;
+            Command::Queue { queue } => {
+                let name = match queue {
+                    Some(raw) => {
+                        let lowered = raw.to_lowercase();
+                        if !Command::name_is_ref_safe(&lowered) {
+                            let _ = self
+                                .rt
+                                .comment(
+                                    repo_id,
+                                    pr,
+                                    &format!(
+                                        "⚠️ `{raw}` isn't a valid queue name — use lowercase \
+                                         letters, digits, and hyphens (e.g. `frontend`)."
+                                    ),
+                                )
+                                .await;
+                            return Ok(());
+                        }
+                        lowered
+                    }
+                    None => "default".to_string(),
+                };
+                let queue_id = Store::get_or_create_queue(&self.db, repo_id, &name).await?;
+                match self.rt.enqueue_pr(queue_id, pr, actor).await {
+                    // enqueue_pr already comments on the PR (queue + position), so
+                    // there's nothing more to say here.
+                    Ok(Enqueued::Ok { .. }) => {}
+                    Ok(Enqueued::WrongBase {
+                        pr_base,
+                        queue_base,
+                    }) => {
+                        let msg = format!(
+                            "⚠️ #{pr} targets `{pr_base}`, but the `{name}` queue lands into \
+                             `{queue_base}`. Only PRs into `{queue_base}` can be queued there."
+                        );
+                        let _ = self.rt.comment(repo_id, pr, &msg).await;
+                    }
+                    Ok(Enqueued::AlreadyQueued { queue }) => {
+                        let msg = format!(
+                            "⚠️ #{pr} is already open in the `{queue}` queue. Remove it there \
+                             first to move it to another queue."
+                        );
+                        let _ = self.rt.comment(repo_id, pr, &msg).await;
+                    }
+                    Err(e) => tracing::warn!(error = %e, pr, "pr-comment queue failed"),
                 }
-                Err(e) => tracing::warn!(error = %e, pr, "pr-comment queue failed"),
-            },
+            }
             Command::Dequeue => {
                 let outcome = match Store::open_entry_id(&self.db, repo_id, pr).await? {
-                    Some(entry_id) => self.rt.force_dequeue(repo_id, entry_id).await.ok(),
+                    Some(entry_id) => self.rt.force_dequeue(entry_id).await.ok(),
                     None => None,
                 };
                 let msg = match outcome {
@@ -426,11 +476,17 @@ pub async fn handle(delivery: Delivery) -> StatusCode {
 mod tests {
     use super::Command;
 
+    fn queue(name: Option<&str>) -> Command {
+        Command::Queue {
+            queue: name.map(str::to_string),
+        }
+    }
+
     #[test]
     fn test_webhook_command_parses_each_spelling() {
-        assert_eq!(Command::parse("/mergequeue queue"), Some(Command::Queue));
-        assert_eq!(Command::parse("/mq queue"), Some(Command::Queue));
-        assert_eq!(Command::parse("/queue"), Some(Command::Queue));
+        assert_eq!(Command::parse("/mergequeue queue"), Some(queue(None)));
+        assert_eq!(Command::parse("/mq queue"), Some(queue(None)));
+        assert_eq!(Command::parse("/queue"), Some(queue(None)));
         assert_eq!(
             Command::parse("/mergequeue dequeue"),
             Some(Command::Dequeue)
@@ -441,15 +497,36 @@ mod tests {
     }
 
     #[test]
+    fn test_webhook_command_parses_queue_name() {
+        assert_eq!(
+            Command::parse("/mq queue frontend"),
+            Some(queue(Some("frontend")))
+        );
+        assert_eq!(
+            Command::parse("/queue backend"),
+            Some(queue(Some("backend")))
+        );
+        assert_eq!(
+            Command::parse("/mergequeue queue release-2"),
+            Some(queue(Some("release-2")))
+        );
+        assert_eq!(
+            Command::parse("/mq queue frontend please"),
+            Some(queue(Some("frontend"))),
+            "only the first token after the verb is the queue name"
+        );
+    }
+
+    #[test]
     fn test_webhook_command_must_lead_its_line() {
         assert_eq!(Command::parse("please /queue this"), None);
         assert_eq!(
             Command::parse("LGTM!\n\n/mq queue\nthanks"),
-            Some(Command::Queue)
+            Some(queue(None))
         );
         assert_eq!(
             Command::parse("   /mergequeue   queue  "),
-            Some(Command::Queue)
+            Some(queue(None))
         );
     }
 
@@ -468,7 +545,18 @@ mod tests {
         assert_eq!(Command::parse("~~~\n/mq queue\n~~~"), None);
         assert_eq!(
             Command::parse("```\n/mq queue\n```\n/queue"),
-            Some(Command::Queue)
+            Some(queue(None))
         );
+    }
+
+    #[test]
+    fn test_webhook_command_name_ref_safety() {
+        assert!(Command::name_is_ref_safe("frontend"));
+        assert!(Command::name_is_ref_safe("release-2"));
+        assert!(Command::name_is_ref_safe("default"));
+        assert!(!Command::name_is_ref_safe("-leading-hyphen"));
+        assert!(!Command::name_is_ref_safe("Has_Underscore"));
+        assert!(!Command::name_is_ref_safe("space here"));
+        assert!(!Command::name_is_ref_safe(""));
     }
 }

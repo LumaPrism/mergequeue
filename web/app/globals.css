@@ -354,7 +354,12 @@ body::before {
   align-items: center;
   gap: var(--s-4);
   flex-wrap: wrap;
+  margin: 0 0 var(--s-6);
   color: var(--text-dim);
+}
+.sb-ctx-cap b {
+  color: var(--text-dim);
+  font-weight: var(--fw-semibold);
 }
 .sb-ctx-item {
   display: inline-flex;
@@ -385,7 +390,7 @@ body::before {
 /* ===== flow ===== */
 .flow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 340px;
+  grid-template-columns: minmax(0, 1fr) 380px;
   gap: var(--s-6);
   align-items: start;
 }
@@ -959,13 +964,11 @@ body::before {
   animation: flap var(--dur-2) var(--flip);
 }
 
-/* ---- side column ---- */
+/* ---- side column (right rail: open PRs + departures board) ---- */
 .side {
-  position: sticky;
-  top: var(--s-6);
   display: flex;
   flex-direction: column;
-  gap: var(--s-4);
+  gap: var(--s-5);
   animation: rise var(--dur-4) 0.12s var(--ease) backwards;
 }
 .card {
@@ -1252,6 +1255,8 @@ a.prlink:hover {
 .errcard-btn:active,
 .toast-undo:active,
 .logout:active,
+.track:active,
+.track-go:active,
 .clink:active {
   transform: translateY(0) scale(0.97);
   filter: brightness(0.97);
@@ -1839,13 +1844,38 @@ a.prlink:hover {
   color: var(--text);
 }
 .modal-error {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
   margin: calc(-1 * var(--s-3)) 0 var(--s-5);
-  padding: var(--s-2) var(--s-3);
+  padding: var(--s-3);
   border: 1px solid color-mix(in srgb, var(--st-eject) 35%, transparent);
   border-radius: var(--r-sm);
   background: color-mix(in srgb, var(--st-eject) 10%, transparent);
   font-size: var(--text-sm);
+  line-height: var(--leading-snug);
   color: var(--st-eject-ink);
+}
+.modal-error::before {
+  content: "";
+  flex: none;
+  margin-top: 0.34em;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--st-eject);
+  box-shadow: 0 0 8px -1px var(--st-eject);
+}
+/* a user-fixable rejection (wrong base, already on another track) reads as an
+   amber caution — a signal to act, not a failure */
+.modal-error.caution {
+  border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--accent);
+}
+.modal-error.caution::before {
+  background: var(--accent);
+  box-shadow: var(--accent-glow);
 }
 .modal-actions {
   display: flex;
@@ -2050,4 +2080,467 @@ a.prlink:hover {
   font-weight: var(--fw-black);
   font-size: var(--text-base);
   line-height: 1;
+}
+
+/* ============================================================= *
+ * PLATFORM SWITCHER — a repo's queues as railway tracks.        *
+ * ============================================================= */
+.pswitch {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--s-5);
+  animation: rise var(--dur-4) 0.08s var(--ease) backwards;
+}
+.pswitch-lbl {
+  flex: none;
+  padding-top: 9px;
+  font-family: var(--font-board);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--text-meta);
+}
+.pswitch-rail {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.track {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: border-color var(--dur-2) var(--ease), color var(--dur-2) var(--ease),
+    background var(--dur-2) var(--ease), box-shadow var(--dur-2) var(--ease);
+  animation: pop var(--dur-2) var(--ease) backwards;
+  animation-delay: calc(var(--i, 0) * 30ms + 0.1s);
+}
+.track:hover {
+  border-color: var(--accent-border);
+  color: var(--text);
+}
+/* a square track-marker (a sleeper), distinct from the round signal pip */
+.track-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  border: 1.5px solid var(--text-meta);
+  transition: border-color var(--dur-2) var(--ease), background var(--dur-2) var(--ease);
+}
+.track-name {
+  font-family: var(--font-board);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-tight);
+  color: inherit;
+}
+/* the platform number — a railway track indicator, lit amber when selected */
+.track-no {
+  flex: none;
+  padding: 1px 5px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-xs);
+  background: color-mix(in srgb, #fff 3%, transparent);
+  font-family: var(--font-board);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "zero" 1;
+  font-size: var(--text-2xs);
+  letter-spacing: 0.04em;
+  color: var(--text-meta);
+  transition: color var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease),
+    background var(--dur-2) var(--ease);
+}
+.track-depth {
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  padding: 1px var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-meta);
+  transition: color var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease),
+    background var(--dur-2) var(--ease);
+}
+.track-depth b {
+  font-variant-numeric: tabular-nums;
+  font-weight: var(--fw-bold);
+  color: var(--text-dim);
+}
+/* the live aspect pip — the active batch's signal colour, grey when clear */
+.track-pip {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--s, var(--st-queued));
+  box-shadow: 0 0 7px -1px var(--s, transparent);
+}
+.track-pip.live {
+  animation: heartbeat 1.8s var(--ease) infinite;
+}
+
+.track.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-subtle);
+  box-shadow: var(--accent-glow);
+}
+.track.on .track-dot {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.track.on .track-no {
+  color: var(--accent);
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
+}
+.track.on .track-depth {
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
+  color: color-mix(in srgb, var(--accent) 70%, var(--text-meta));
+}
+.track.on .track-depth b {
+  color: var(--accent);
+}
+
+.track-new {
+  border-style: dashed;
+  color: var(--text-meta);
+}
+.track-new:hover {
+  border-style: solid;
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+.track-plus {
+  font-weight: var(--fw-black);
+  font-size: var(--text-base);
+  line-height: 1;
+}
+
+.track-form {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.track-input {
+  cursor: default;
+  border-color: var(--accent-border);
+  padding-right: var(--s-1);
+  animation: none;
+}
+.track-input.bad {
+  border-color: color-mix(in srgb, var(--st-eject) 50%, transparent);
+}
+.track-field {
+  width: 9ch;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--font-board);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-tight);
+  outline: none;
+}
+.track-field::placeholder {
+  color: var(--text-meta);
+}
+.track-go {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-pill);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+  transition: background var(--dur-2) var(--ease), color var(--dur-2) var(--ease);
+}
+.track-go:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.track-go:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.track-hint {
+  padding-left: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-meta);
+}
+.track-hint.bad {
+  color: var(--st-eject-ink);
+}
+
+/* ============================================================= *
+ * DEPARTURES BOARD — run history, promoted to a first-class,    *
+ * full-width signal surface below the active train               *
+ * (TIME · TRACK · SERVICE · ASPECT).                            *
+ * ============================================================= */
+.dep {
+  position: relative;
+  margin-top: var(--s-7);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  backdrop-filter: blur(10px);
+  overflow: hidden;
+  box-shadow: var(--elev-2);
+  animation: rise var(--dur-4) 0.16s var(--ease) backwards;
+}
+/* the thin amber top-rule — a lit signal gantry across the board head */
+.dep::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent) 12%, var(--accent) 88%, transparent);
+  box-shadow: 0 0 14px -2px color-mix(in srgb, var(--accent) 70%, transparent);
+  z-index: var(--z-rail);
+}
+
+.dep-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-5) var(--s-6);
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+}
+.dep-live {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: var(--accent-glow);
+  animation: heartbeat 2.4s var(--ease) infinite;
+}
+.dep-title {
+  font-family: var(--font-board);
+  font-size: var(--text-lg);
+  font-weight: var(--fw-black);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.dep-sub {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-meta);
+}
+
+.dep-cols,
+.dep-row {
+  display: grid;
+  grid-template-columns: minmax(5rem, 7rem) minmax(6rem, 12rem) minmax(0, 1fr) minmax(8rem, auto);
+  align-items: center;
+  gap: var(--s-5);
+  padding: 0 var(--s-6);
+}
+.dep-cols {
+  padding-top: var(--s-3);
+  padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-board);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--text-meta);
+}
+.dep-cols span:last-child {
+  justify-self: end;
+}
+
+.dep-rows {
+  perspective: 900px;
+}
+.dep-row {
+  min-height: 54px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--text-sm);
+  transform-origin: top center;
+  animation: dep-flap var(--dur-3) var(--flip) backwards;
+  animation-delay: calc(var(--i, 0) * 55ms + 80ms);
+  transition: background var(--dur-2) var(--ease);
+}
+.dep-row:last-child {
+  border-bottom: none;
+}
+.dep-row:hover {
+  background: var(--surface-2);
+}
+.dep-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-xs);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.dep-track {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  font-family: var(--font-board);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-tight);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* a square sleeper marker, echoing the platform switcher's track chips */
+.dep-track::before {
+  content: "";
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  border: 1.5px solid var(--text-meta);
+}
+.dep-service {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "zero" 1;
+  font-size: var(--text-sm);
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dep-pr {
+  color: var(--accent);
+}
+.dep-sep {
+  color: var(--text-meta);
+}
+/* the signal-aspect chip — a lit lamp + board-voice label, tinted to its hue */
+.dep-aspect {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: 4px 11px 4px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, var(--s) var(--tint-bd-pct), transparent);
+  background: color-mix(in srgb, var(--s) var(--tint-bg-pct), transparent);
+  font-family: var(--font-board);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--s-ink);
+}
+.dep-lamp {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--s);
+  box-shadow: 0 0 9px -1px var(--s);
+}
+.dep-aspect.departed {
+  --s: var(--st-merge);
+  --s-ink: var(--st-merge-ink);
+}
+.dep-aspect.failed {
+  --s: var(--st-eject);
+  --s-ink: var(--st-eject-ink);
+}
+.dep-aspect.cancelled {
+  --s: var(--st-superseded);
+  --s-ink: var(--st-superseded-ink);
+}
+
+.dep-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-12) var(--s-6);
+  text-align: center;
+}
+.dep-empty-lamp {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--st-queued);
+  box-shadow: 0 0 12px -2px var(--st-queued);
+  opacity: 0.7;
+}
+.dep-empty-k {
+  font-family: var(--font-board);
+  font-size: var(--text-lg);
+  font-weight: var(--fw-bold);
+  letter-spacing: var(--tracking-board);
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.dep-empty-sub {
+  max-width: 46ch;
+  font-size: var(--text-sm);
+  color: var(--text-meta);
+  line-height: var(--leading-normal);
+}
+
+.dep-skel {
+  animation: none;
+}
+.dep-skel .skel-bar {
+  height: 12px;
+}
+
+@media (max-width: 640px) {
+  .dep-cols,
+  .dep-row {
+    grid-template-columns: minmax(3.2rem, auto) minmax(3.4rem, 6rem) minmax(0, 1fr) auto;
+    gap: var(--s-3);
+    padding-left: var(--s-4);
+    padding-right: var(--s-4);
+  }
+  .dep-service {
+    font-size: var(--text-xs);
+  }
+}
+
+@keyframes dep-flap {
+  from {
+    opacity: 0;
+    transform: rotateX(-82deg);
+  }
+  60% {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+    transform: rotateX(0);
+  }
 }
