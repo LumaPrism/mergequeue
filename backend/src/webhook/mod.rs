@@ -16,23 +16,34 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::runtime::{Enqueued, Removed, Runtime, SecretCell};
-use crate::store::Store;
+use crate::store::{EntryStore, InstallationStore, QueueStore, RepoStore};
 
-/// Verify `X-Hub-Signature-256: sha256=<hex>` against the raw body.
-pub fn verify_signature(secret: &SecretString, signature: &str, body: &[u8]) -> bool {
-    let Some(hex_sig) = signature.strip_prefix("sha256=") else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(hex_sig) else {
-        return false;
-    };
-    let mut mac = match Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes()) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    mac.update(body);
-    let computed = mac.finalize().into_bytes();
-    computed.ct_eq(expected.as_slice()).into()
+#[derive(Debug, thiserror::Error)]
+pub enum WebhookError {
+    #[error("database error: {0}")]
+    Db(#[from] DbErr),
+}
+
+/// Verifies `X-Hub-Signature-256` HMAC-SHA256 signatures against a raw body.
+pub struct SignatureVerifier;
+
+impl SignatureVerifier {
+    /// Verify `X-Hub-Signature-256: sha256=<hex>` against the raw body.
+    pub fn verify(secret: &SecretString, signature: &str, body: &[u8]) -> bool {
+        let Some(hex_sig) = signature.strip_prefix("sha256=") else {
+            return false;
+        };
+        let Ok(expected) = hex::decode(hex_sig) else {
+            return false;
+        };
+        let mut mac = match Hmac::<Sha256>::new_from_slice(secret.expose_secret().as_bytes()) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        mac.update(body);
+        let computed = mac.finalize().into_bytes();
+        computed.ct_eq(expected.as_slice()).into()
+    }
 }
 
 /// Webhook events we act on. Everything else is acknowledged and ignored.
@@ -51,6 +62,9 @@ pub enum RelevantEvent {
 }
 
 impl RelevantEvent {
+    /// Map a `X-GitHub-Event` header value to a `RelevantEvent`, or `None` for
+    /// event types we don't act on. The `_ =>` arm is unavoidable here: GitHub
+    /// sends arbitrary event-type strings.
     pub fn from_header(event: &str) -> Option<Self> {
         match event {
             "installation" | "installation_repositories" => Some(Self::Installation),
@@ -73,12 +87,17 @@ enum Command {
     Dequeue,
 }
 
-impl Command {
+/// Parses `/mergequeue`-family commands from PR comment bodies.
+struct CommandParser;
+
+impl CommandParser {
     /// First command found across the comment's lines, or `None`. A command must
     /// lead its line — `/mergequeue <verb>`, `/mq <verb>`, or the bare `/<verb>` —
     /// and lines inside fenced code blocks (``` or ~~~) are ignored. The token after
     /// `queue` is captured as the optional target queue name.
-    fn parse(body: &str) -> Option<Self> {
+    ///
+    /// The `_ =>` arms match arbitrary user-supplied tokens and are unavoidable.
+    fn parse(body: &str) -> Option<Command> {
         let mut in_fence = false;
         for line in body.lines() {
             let trimmed = line.trim_start();
@@ -101,19 +120,19 @@ impl Command {
             };
             match verb {
                 "queue" => {
-                    return Some(Self::Queue {
+                    return Some(Command::Queue {
                         queue: tok.next().map(str::to_string),
                     });
                 }
-                "dequeue" | "unqueue" => return Some(Self::Dequeue),
+                "dequeue" | "unqueue" => return Some(Command::Dequeue),
                 _ => continue,
             }
         }
         None
     }
 
-    /// A queue name is ref-safe iff it matches `^[a-z0-9][a-z0-9-]*$` — it's folded
-    /// directly into the staging ref.
+    /// A queue name is ref-safe iff it matches `^[a-z0-9][a-z0-9-]*$` — it is
+    /// folded directly into the staging ref.
     fn name_is_ref_safe(name: &str) -> bool {
         let mut chars = name.chars();
         match chars.next() {
@@ -221,39 +240,60 @@ impl Webhook {
         }
     }
 
-    async fn on_installation(&self, ev: InstallationEvent) -> Result<(), DbErr> {
+    async fn on_installation(&self, ev: InstallationEvent) -> Result<(), WebhookError> {
         let installation_id = ev.installation.id;
         if ev.action == "deleted" {
-            return Store::deprovision_installation(&self.db, installation_id).await;
+            return InstallationStore::deprovision_installation(&self.db, installation_id)
+                .await
+                .map_err(WebhookError::from);
         }
-        Store::provision_installation(&self.db, installation_id, &ev.installation.account.login)
-            .await?;
+        InstallationStore::provision_installation(
+            &self.db,
+            installation_id,
+            &ev.installation.account.login,
+        )
+        .await?;
 
         let mut added = ev.repositories.unwrap_or_default();
         added.extend(ev.repositories_added.unwrap_or_default());
         for repo in added {
             if let Some((owner, name)) = repo.split() {
-                Store::upsert_repo(&self.db, installation_id, owner, name).await?;
+                RepoStore::upsert_repo(&self.db, installation_id, owner, name).await?;
             }
         }
         for repo in ev.repositories_removed.unwrap_or_default() {
             if let Some((owner, name)) = repo.split() {
-                Store::delete_repo(&self.db, owner, name).await?;
+                RepoStore::delete_repo(&self.db, owner, name).await?;
             }
         }
         Ok(())
     }
 
-    async fn on_pull_request(&self, ev: PullRequestEvent) -> Result<(), DbErr> {
+    /// A closed PR drops out of its queue. The PR's queue is resolved from its open
+    /// entry *before* dequeuing (the entry is gone afterwards) so the label clear
+    /// targets that queue's own label variants; a PR in no queue has nothing to clear.
+    async fn on_pull_request(&self, ev: PullRequestEvent) -> Result<(), WebhookError> {
         if ev.action != "closed" {
             return Ok(());
         }
         let Some((owner, name)) = ev.repository.split() else {
             return Ok(());
         };
-        let removed = Store::dequeue_pr(&self.db, owner, name, ev.number).await?;
-        if removed && let Some(repo_id) = Store::repo_id_by_name(&self.db, owner, name).await? {
-            let _ = self.rt.set_pr_label(repo_id, ev.number as u64, None).await;
+        let Some(repo_id) = RepoStore::repo_id_by_name(&self.db, owner, name).await? else {
+            return Ok(());
+        };
+        let pr = ev.number as u64;
+        let queue = match EntryStore::open_entry(&self.db, repo_id, pr).await? {
+            Some(entry) => Some(
+                QueueStore::queue_config(&self.db, entry.queue_id)
+                    .await?
+                    .name,
+            ),
+            None => None,
+        };
+        let removed = EntryStore::dequeue_pr(&self.db, owner, name, ev.number).await?;
+        if removed && let Some(queue) = queue {
+            let _ = self.rt.set_pr_label(repo_id, pr, None, &queue).await;
         }
         Ok(())
     }
@@ -261,28 +301,25 @@ impl Webhook {
     /// A PR comment: run a `/mergequeue` queue command if present and the commenter
     /// is authorized. Replies on the PR with the outcome. GitHub-side failures
     /// (e.g. posting the reply) are logged, not surfaced — the ack still succeeds.
-    async fn on_issue_comment(&self, ev: IssueCommentEvent) -> Result<(), DbErr> {
+    async fn on_issue_comment(&self, ev: IssueCommentEvent) -> Result<(), WebhookError> {
         if ev.action != "created" || ev.issue.pull_request.is_none() {
             return Ok(());
         }
         if ev.comment.user.login.ends_with("[bot]") {
             return Ok(());
         }
-        let Some(cmd) = Command::parse(&ev.comment.body) else {
+        let Some(cmd) = CommandParser::parse(&ev.comment.body) else {
             return Ok(());
         };
         let Some((owner, name)) = ev.repository.split() else {
             return Ok(());
         };
-        let Some(repo_id) = Store::repo_id_by_name(&self.db, owner, name).await? else {
+        let Some(repo_id) = RepoStore::repo_id_by_name(&self.db, owner, name).await? else {
             return Ok(());
         };
         let pr = ev.issue.number as u64;
         let actor = ev.comment.user.login.as_str();
 
-        // Authorize against real repo permission. author_association (e.g. MEMBER)
-        // does not imply write access — a read-only org member must not drive the
-        // queue. Fail closed if the permission check itself errors.
         let authorized = match self.rt.can_write(repo_id, actor).await {
             Ok(w) => w,
             Err(e) => {
@@ -295,8 +332,6 @@ impl Webhook {
             return Ok(());
         }
 
-        // GitHub delivers issue_comment for closed PRs too — never queue a closed PR
-        // (its head must not be merged into base).
         if ev.issue.state != "open" {
             if matches!(cmd, Command::Queue { .. }) {
                 let _ = self
@@ -316,7 +351,7 @@ impl Webhook {
                 let name = match queue {
                     Some(raw) => {
                         let lowered = raw.to_lowercase();
-                        if !Command::name_is_ref_safe(&lowered) {
+                        if !CommandParser::name_is_ref_safe(&lowered) {
                             let _ = self
                                 .rt
                                 .comment(
@@ -334,10 +369,8 @@ impl Webhook {
                     }
                     None => "default".to_string(),
                 };
-                let queue_id = Store::get_or_create_queue(&self.db, repo_id, &name).await?;
+                let queue_id = QueueStore::get_or_create_queue(&self.db, repo_id, &name).await?;
                 match self.rt.enqueue_pr(queue_id, pr, actor).await {
-                    // enqueue_pr already comments on the PR (queue + position), so
-                    // there's nothing more to say here.
                     Ok(Enqueued::Ok { .. }) => {}
                     Ok(Enqueued::WrongBase {
                         pr_base,
@@ -360,7 +393,7 @@ impl Webhook {
                 }
             }
             Command::Dequeue => {
-                let outcome = match Store::open_entry_id(&self.db, repo_id, pr).await? {
+                let outcome = match EntryStore::open_entry_id(&self.db, repo_id, pr).await? {
                     Some(entry_id) => self.rt.force_dequeue(entry_id).await.ok(),
                     None => None,
                 };
@@ -438,7 +471,7 @@ pub async fn handle(delivery: Delivery) -> StatusCode {
         let Some(secret) = guard.as_ref() else {
             return StatusCode::SERVICE_UNAVAILABLE;
         };
-        if !verify_signature(secret, &signature, &body) {
+        if !SignatureVerifier::verify(secret, &signature, &body) {
             return StatusCode::UNAUTHORIZED;
         }
     }
@@ -474,7 +507,7 @@ pub async fn handle(delivery: Delivery) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
-    use super::Command;
+    use super::{Command, CommandParser};
 
     fn queue(name: Option<&str>) -> Command {
         Command::Queue {
@@ -484,34 +517,34 @@ mod tests {
 
     #[test]
     fn test_webhook_command_parses_each_spelling() {
-        assert_eq!(Command::parse("/mergequeue queue"), Some(queue(None)));
-        assert_eq!(Command::parse("/mq queue"), Some(queue(None)));
-        assert_eq!(Command::parse("/queue"), Some(queue(None)));
+        assert_eq!(CommandParser::parse("/mergequeue queue"), Some(queue(None)));
+        assert_eq!(CommandParser::parse("/mq queue"), Some(queue(None)));
+        assert_eq!(CommandParser::parse("/queue"), Some(queue(None)));
         assert_eq!(
-            Command::parse("/mergequeue dequeue"),
+            CommandParser::parse("/mergequeue dequeue"),
             Some(Command::Dequeue)
         );
-        assert_eq!(Command::parse("/mq dequeue"), Some(Command::Dequeue));
-        assert_eq!(Command::parse("/dequeue"), Some(Command::Dequeue));
-        assert_eq!(Command::parse("/unqueue"), Some(Command::Dequeue));
+        assert_eq!(CommandParser::parse("/mq dequeue"), Some(Command::Dequeue));
+        assert_eq!(CommandParser::parse("/dequeue"), Some(Command::Dequeue));
+        assert_eq!(CommandParser::parse("/unqueue"), Some(Command::Dequeue));
     }
 
     #[test]
     fn test_webhook_command_parses_queue_name() {
         assert_eq!(
-            Command::parse("/mq queue frontend"),
+            CommandParser::parse("/mq queue frontend"),
             Some(queue(Some("frontend")))
         );
         assert_eq!(
-            Command::parse("/queue backend"),
+            CommandParser::parse("/queue backend"),
             Some(queue(Some("backend")))
         );
         assert_eq!(
-            Command::parse("/mergequeue queue release-2"),
+            CommandParser::parse("/mergequeue queue release-2"),
             Some(queue(Some("release-2")))
         );
         assert_eq!(
-            Command::parse("/mq queue frontend please"),
+            CommandParser::parse("/mq queue frontend please"),
             Some(queue(Some("frontend"))),
             "only the first token after the verb is the queue name"
         );
@@ -519,44 +552,47 @@ mod tests {
 
     #[test]
     fn test_webhook_command_must_lead_its_line() {
-        assert_eq!(Command::parse("please /queue this"), None);
+        assert_eq!(CommandParser::parse("please /queue this"), None);
         assert_eq!(
-            Command::parse("LGTM!\n\n/mq queue\nthanks"),
+            CommandParser::parse("LGTM!\n\n/mq queue\nthanks"),
             Some(queue(None))
         );
         assert_eq!(
-            Command::parse("   /mergequeue   queue  "),
+            CommandParser::parse("   /mergequeue   queue  "),
             Some(queue(None))
         );
     }
 
     #[test]
     fn test_webhook_command_ignores_non_commands() {
-        assert_eq!(Command::parse("looks good to me"), None);
-        assert_eq!(Command::parse("/help"), None);
-        assert_eq!(Command::parse("/mq"), None);
-        assert_eq!(Command::parse("/mqqueue"), None);
-        assert_eq!(Command::parse("/mergequeueueue queue"), None);
+        assert_eq!(CommandParser::parse("looks good to me"), None);
+        assert_eq!(CommandParser::parse("/help"), None);
+        assert_eq!(CommandParser::parse("/mq"), None);
+        assert_eq!(CommandParser::parse("/mqqueue"), None);
+        assert_eq!(CommandParser::parse("/mergequeueueue queue"), None);
     }
 
     #[test]
     fn test_webhook_command_ignores_code_fences() {
-        assert_eq!(Command::parse("how to:\n```\n/queue\n```\nthanks"), None);
-        assert_eq!(Command::parse("~~~\n/mq queue\n~~~"), None);
         assert_eq!(
-            Command::parse("```\n/mq queue\n```\n/queue"),
+            CommandParser::parse("how to:\n```\n/queue\n```\nthanks"),
+            None
+        );
+        assert_eq!(CommandParser::parse("~~~\n/mq queue\n~~~"), None);
+        assert_eq!(
+            CommandParser::parse("```\n/mq queue\n```\n/queue"),
             Some(queue(None))
         );
     }
 
     #[test]
     fn test_webhook_command_name_ref_safety() {
-        assert!(Command::name_is_ref_safe("frontend"));
-        assert!(Command::name_is_ref_safe("release-2"));
-        assert!(Command::name_is_ref_safe("default"));
-        assert!(!Command::name_is_ref_safe("-leading-hyphen"));
-        assert!(!Command::name_is_ref_safe("Has_Underscore"));
-        assert!(!Command::name_is_ref_safe("space here"));
-        assert!(!Command::name_is_ref_safe(""));
+        assert!(CommandParser::name_is_ref_safe("frontend"));
+        assert!(CommandParser::name_is_ref_safe("release-2"));
+        assert!(CommandParser::name_is_ref_safe("default"));
+        assert!(!CommandParser::name_is_ref_safe("-leading-hyphen"));
+        assert!(!CommandParser::name_is_ref_safe("Has_Underscore"));
+        assert!(!CommandParser::name_is_ref_safe("space here"));
+        assert!(!CommandParser::name_is_ref_safe(""));
     }
 }

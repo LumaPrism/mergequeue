@@ -12,6 +12,8 @@ default:
 dev: db
     #!/usr/bin/env bash
     set -uo pipefail
+    # free ports left held by an orphaned backend/next-server from a previous run
+    fuser -k 8080/tcp 3001/tcp 2>/dev/null && sleep 1 || true
     trap 'echo; echo "↩ stopping dev stack"; kill 0' EXIT
     echo "▶ backend   http://localhost:8080"
     ( cd backend && cargo run ) &
@@ -41,6 +43,14 @@ web:
 smee:
     smee --url "${MQ_SMEE_URL:?set MQ_SMEE_URL in .env (your smee.io channel)}" --target "{{smee_target}}"
 
+# run SeaORM migrations (default: `up`; pass `down`, `fresh`, `status`, …)
+migrate *args="up": db
+    cd backend && DATABASE_URL="${MQ_DATABASE__URL}" cargo run -p migration -- {{args}}
+
 # regenerate the shared TS types from the Rust backend
 regen-types:
     cd web && just regen-types
+
+# generate a 32-char key for MQ_SECRET__KEY (at-rest encryption of App secrets)
+gen-secret-key:
+    @openssl rand -base64 24

@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -15,6 +15,10 @@ pub struct Config {
     pub github: Option<GitHubConfig>,
     pub server: ServerConfig,
     pub database: DatabaseConfig,
+    /// Master key for at-rest encryption of the DB-stored App secrets. Absent
+    /// pre-setup; required once a `github_app` row holds encrypted values.
+    #[serde(default)]
+    pub secret: Option<SecretConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -65,6 +69,57 @@ impl ServerConfig {
 #[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub url: SecretString,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct SecretConfig {
+    /// 32-character key, used directly as the 32 key bytes. Wins over `key_file`.
+    pub key: Option<SecretString>,
+    /// Path to a file holding the 32-character key (trailing newline trimmed).
+    pub key_file: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigKeyError {
+    #[error("no encryption key configured (set MQ_SECRET__KEY or MQ_SECRET__KEY_FILE)")]
+    Missing,
+    #[error("could not read MQ_SECRET__KEY_FILE: {0}")]
+    KeyFile(#[from] std::io::Error),
+    #[error("encryption key must be exactly 32 bytes, got {0}")]
+    BadLength(usize),
+    #[error(transparent)]
+    Crypto(#[from] crate::crypto::CryptoError),
+}
+
+impl SecretConfig {
+    /// Resolve the raw 32-byte key: inline `key` wins, else `key_file` contents.
+    pub fn resolve(&self) -> Result<secrecy::zeroize::Zeroizing<Vec<u8>>, ConfigKeyError> {
+        let raw = if let Some(k) = &self.key {
+            k.expose_secret().to_owned()
+        } else if let Some(path) = &self.key_file {
+            std::fs::read_to_string(path)?.trim_end().to_owned()
+        } else {
+            return Err(ConfigKeyError::Missing);
+        };
+        let bytes = raw.into_bytes();
+        if bytes.len() != 32 {
+            return Err(ConfigKeyError::BadLength(bytes.len()));
+        }
+        Ok(secrecy::zeroize::Zeroizing::new(bytes))
+    }
+}
+
+/// Build the crypto handle from config. `None` when no key is configured.
+pub fn crypto_from_config(
+    cfg: &Config,
+) -> Result<Option<crate::crypto::SecretCrypto>, ConfigKeyError> {
+    match &cfg.secret {
+        Some(s) => {
+            let key = s.resolve()?;
+            Ok(Some(crate::crypto::SecretCrypto::new(&key[..])?))
+        }
+        None => Ok(None),
+    }
 }
 
 fn default_port() -> u16 {
@@ -136,5 +191,38 @@ impl fmt::Debug for ServerConfig {
             .field("app_url", &self.app_url)
             .field("port", &self.port)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    use secrecy::SecretString;
+
+    fn cfg(key: &str) -> SecretConfig {
+        SecretConfig {
+            key: Some(SecretString::from(key.to_string())),
+            key_file: None,
+        }
+    }
+
+    #[test]
+    fn accepts_32_byte_key() {
+        let bytes = cfg("SaorcGejM8KgmKFsYjxKh22K5DhE2YO1").resolve().unwrap();
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn rejects_short_key() {
+        assert!(cfg("too-short").resolve().is_err());
+    }
+
+    #[test]
+    fn rejects_long_key() {
+        assert!(
+            cfg("SaorcGejM8KgmKFsYjxKh22K5DhE2YO1-EXTRA")
+                .resolve()
+                .is_err()
+        );
     }
 }

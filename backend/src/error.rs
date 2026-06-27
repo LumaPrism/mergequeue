@@ -20,6 +20,15 @@ pub enum Error {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    Crypto(#[from] crate::crypto::CryptoError),
+
+    #[error(transparent)]
+    Open(#[from] crate::setup::OpenError),
+
+    #[error(transparent)]
+    ConfigKey(#[from] crate::config::ConfigKeyError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

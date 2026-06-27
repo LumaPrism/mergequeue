@@ -51,6 +51,18 @@ demand (never persist tokens). Repos are scoped to their installation.
 needs a GitHub App (App ID, private key, webhook secret, client id/secret) — see
 the README for the App's permissions and event subscriptions.
 
+### Secrets at rest
+
+The DB-stored GitHub App secrets (`github_app.private_key`, `client_secret`,
+`webhook_secret`) are encrypted with ChaCha20-Poly1305 using `MQ_SECRET__KEY` — a
+32-char key held outside Postgres (env or `MQ_SECRET__KEY_FILE`). Each value is
+stored as `enc:<hex(nonce‖ciphertext‖tag)>`, so a leaked DB dump is undecryptable
+without the key. The key is required before `/setup` will register an App; a
+pre-existing plaintext row is re-encrypted in place on the next `reinit`. There is
+no key rotation — losing the key means re-registering the App. The static config
+escape hatch (`MQ_GITHUB__*`) stays plaintext on the host filesystem by the
+operator's choice (the normal 12-factor posture); it never touches the DB.
+
 ## Conventions
 
 Code organisation: module-per-concern, a store pattern for all DB access,

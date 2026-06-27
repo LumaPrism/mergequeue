@@ -8,6 +8,7 @@
 mod api;
 mod auth;
 mod config;
+mod crypto;
 mod error;
 mod github;
 mod queue;
@@ -75,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(error = %e, "worker: installation sync failed");
                 }
                 n = n.wrapping_add(1);
-                let queues = match store::Store::active_queue_ids(&rt.db()).await {
+                let queues = match store::QueueStore::active_queue_ids(&rt.db()).await {
                     Ok(ids) => ids,
                     Err(e) => {
                         tracing::warn!(error = %e, "worker: listing queues failed");

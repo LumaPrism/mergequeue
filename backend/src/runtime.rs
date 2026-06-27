@@ -3,6 +3,12 @@
 //! instance start processing immediately — no restart. `reinit` resolves the
 //! credentials and rebuilds the engine; the worker reads `engine()` each tick and
 //! the webhook reads the shared secret cell.
+//!
+//! [`Runtime`] owns the hot-swap cells and the engine, and exposes the operator
+//! API as thin facades that snapshot the live client/secret/app and delegate to
+//! the zero-sized service structs in this module ([`RepoOps`], [`QueueOps`],
+//! [`Sync`], [`AppManagement`]) — the orchestration logic itself takes its deps
+//! (`db`, the repo client) as plain arguments, like the stores.
 
 use std::sync::Arc;
 
@@ -18,11 +24,12 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::Result;
 use crate::github::{
-    AppClient, GitHubError, GitHubRepoClient, PullSummary, RepoClient, RepoId, TrainLabel,
+    AppClient, AppCredentials, GitHubError, GitHubRepoClient, PullSummary, RepoClient, RepoId,
+    TrainLabel,
 };
 use crate::queue::{BatchState, Engine, EntryState, LedgerRecord, QueueEntry};
-use crate::setup::resolve_credentials;
-use crate::store::Store;
+use crate::setup::SetupService;
+use crate::store::{BatchStore, EntryStore, InstallationStore, LedgerStore, QueueStore, RepoStore};
 
 /// Shared, late-initialized webhook secret. The webhook handler and the runtime
 /// hold the same cell, so a post-startup `/setup` makes the secret live at once.
@@ -69,11 +76,7 @@ impl Runtime {
             return Some(o);
         }
         let app = self.app.read().await.clone()?;
-        let info: AppInfo = app.app().get("/app", None::<&()>).await.ok()?;
-        let owner = AppOwner {
-            is_org: info.owner.kind == "Organization",
-            login: info.owner.login,
-        };
+        let owner = AppManagement::fetch_owner(&app).await?;
         *self.app_owner.write().await = Some(owner.clone());
         Some(owner)
     }
@@ -92,35 +95,33 @@ impl Runtime {
         self.engine.read().await.clone()
     }
 
-    /// Open PRs for a repo (queue candidates). Empty if the App isn't configured yet.
+    /// Open PRs for a repo (queue candidates). Empty if the App isn't configured
+    /// yet; otherwise delegates to [`RepoOps::list_open_pulls`].
     pub async fn list_open_pulls(&self, repo_id: Uuid) -> Result<Vec<PullSummary>> {
         let Some(client) = self.repo_client.read().await.clone() else {
             return Ok(vec![]);
         };
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
-        Ok(client.list_open_pulls(&gh).await?)
+        RepoOps::list_open_pulls(&self.db, client.as_ref(), repo_id).await
     }
 
     /// Whether `username` has write (or admin) access to the repo — the authz gate
     /// for PR-comment queue commands and the dashboard's queue mutations. `false`
-    /// when the App isn't configured.
+    /// when the App isn't configured; otherwise delegates to [`RepoOps::can_write`].
     pub async fn can_write(&self, repo_id: Uuid, username: &str) -> Result<bool> {
         let Some(client) = self.repo_client.read().await.clone() else {
             return Ok(false);
         };
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
-        Ok(client.user_permission(&gh, username).await?.can_write())
+        RepoOps::can_write(&self.db, client.as_ref(), repo_id, username).await
     }
 
     /// The required status-check contexts on `branch`'s protection, read live from
-    /// GitHub — used to seed a new queue whose base differs from the repo's default
-    /// queue. Empty when the App isn't configured yet.
+    /// GitHub. Empty when the App isn't configured yet; otherwise delegates to
+    /// [`RepoOps::required_checks`].
     pub async fn required_checks(&self, repo_id: Uuid, branch: &str) -> Result<Vec<String>> {
         let Some(client) = self.repo_client.read().await.clone() else {
             return Ok(vec![]);
         };
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
-        Ok(client.required_checks(&gh, branch).await?)
+        RepoOps::required_checks(&self.db, client.as_ref(), repo_id, branch).await
     }
 
     /// Test seam: install just the repo client so API authz and branch-protection
@@ -131,26 +132,177 @@ impl Runtime {
     }
 
     /// Post a comment on a PR (the PR-comment command's reply). No-op when the App
-    /// isn't configured.
+    /// isn't configured; otherwise delegates to [`RepoOps::comment`].
     pub async fn comment(&self, repo_id: Uuid, pr: u64, body: &str) -> Result<()> {
         let Some(client) = self.repo_client.read().await.clone() else {
             return Ok(());
         };
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
+        RepoOps::comment(&self.db, client.as_ref(), repo_id, pr, body).await
+    }
+
+    /// Validate and enqueue a PR into a specific queue — see [`QueueOps::enqueue_pr`].
+    /// Snapshots the live repo client; the service errors when the App isn't
+    /// configured.
+    pub async fn enqueue_pr(&self, queue_id: Uuid, pr: u64, by: &str) -> Result<Enqueued> {
+        let client = self.repo_client.read().await.clone();
+        QueueOps::enqueue_pr(&self.db, client, queue_id, pr, by).await
+    }
+
+    /// Best-effort merge-train label on a PR, set outside the engine loop (dashboard
+    /// dequeue, PR close). `None` clears the label when a PR leaves the train. No-op
+    /// when the App isn't configured; otherwise delegates to [`RepoOps::set_pr_label`].
+    pub async fn set_pr_label(
+        &self,
+        repo_id: Uuid,
+        pr: u64,
+        target: Option<TrainLabel>,
+        queue: &str,
+    ) -> Result<()> {
+        let Some(client) = self.repo_client.read().await.clone() else {
+            return Ok(());
+        };
+        RepoOps::set_pr_label(&self.db, client.as_ref(), repo_id, pr, target, queue).await
+    }
+
+    /// Remove a PR from the train whatever its state — see [`QueueOps::force_dequeue`].
+    /// Snapshots the live repo client (GitHub side effects are skipped when the App
+    /// isn't configured).
+    pub async fn force_dequeue(&self, entry_id: Uuid) -> Result<Removed> {
+        let client = self.repo_client.read().await.clone();
+        QueueOps::force_dequeue(&self.db, client, entry_id).await
+    }
+
+    /// Resolve credentials and (re)build the engine + webhook secret, then swap the
+    /// hot-swap cells. Returns whether the App is now configured. Idempotent; called
+    /// at startup and again from the `/setup` callback so registration takes effect
+    /// without a restart. Component construction lives in [`AppManagement::build_components`];
+    /// only the cell swap stays here, since that is the hot-swap state Runtime owns.
+    pub async fn reinit(&self) -> Result<bool> {
+        let Some(creds) = SetupService::resolve_credentials(&self.cfg, &self.db).await? else {
+            return Ok(false);
+        };
+        // Only the manifest/DB path stores secrets, so only it gets the at-rest
+        // encryption. Static config credentials (`cfg.github`) never touch the
+        // `github_app` row — re-encrypting here would (a) make an unused/bad
+        // MQ_SECRET__KEY block static deployments and (b) overwrite a stale
+        // plaintext row with the static app's secrets. Skip it entirely.
+        if self.cfg.github.is_none() {
+            let crypto = crate::config::crypto_from_config(&self.cfg)?;
+            SetupService::reencrypt_legacy_if_needed(&self.db, crypto.as_ref(), &creds).await?;
+        }
+        let built = AppManagement::build_components(creds, &self.db)?;
+        *self.engine.write().await = Some(built.engine);
+        *self.webhook_secret.write().await = Some(built.secret);
+        *self.app.write().await = Some(built.app);
+        *self.repo_client.write().await = Some(built.repo_client);
+        *self.app_owner.write().await = None;
+        Ok(true)
+    }
+
+    /// Reconcile installations + their repos from the App API — see
+    /// [`Sync::sync_installations`]. No-op until the App is configured.
+    pub async fn sync_installations(&self) -> Result<()> {
+        let Some(app) = self.app.read().await.clone() else {
+            return Ok(());
+        };
+        let repo_client = self.repo_client.read().await.clone();
+        Sync::sync_installations(&self.db, &app, repo_client).await
+    }
+}
+
+/// Repo-level GitHub operations behind the App's repo client. Zero-sized; all
+/// behavior is associated functions taking `db` + the resolved `client`. The
+/// not-configured fallbacks live on the [`Runtime`] facades.
+#[derive(Debug, Clone, Copy)]
+pub struct RepoOps;
+
+impl RepoOps {
+    /// Open PRs for a repo (queue candidates).
+    pub async fn list_open_pulls(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        repo_id: Uuid,
+    ) -> Result<Vec<PullSummary>> {
+        let gh = RepoStore::repo_ref(db, repo_id).await?;
+        Ok(client.list_open_pulls(&gh).await?)
+    }
+
+    /// Whether `username` has write (or admin) access to the repo.
+    pub async fn can_write(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        repo_id: Uuid,
+        username: &str,
+    ) -> Result<bool> {
+        let gh = RepoStore::repo_ref(db, repo_id).await?;
+        Ok(client.user_permission(&gh, username).await?.can_write())
+    }
+
+    /// The required status-check contexts on `branch`'s protection, read live from
+    /// GitHub — used to seed a new queue whose base differs from the repo's default
+    /// queue.
+    pub async fn required_checks(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        repo_id: Uuid,
+        branch: &str,
+    ) -> Result<Vec<String>> {
+        let gh = RepoStore::repo_ref(db, repo_id).await?;
+        Ok(client.required_checks(&gh, branch).await?)
+    }
+
+    /// Post a comment on a PR.
+    pub async fn comment(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        repo_id: Uuid,
+        pr: u64,
+        body: &str,
+    ) -> Result<()> {
+        let gh = RepoStore::repo_ref(db, repo_id).await?;
         client.comment(&gh, pr, body).await?;
         Ok(())
     }
 
+    /// Set (or, with `None`, clear) the merge-train label on a PR for `queue`.
+    pub async fn set_pr_label(
+        db: &DatabaseConnection,
+        client: &dyn RepoClient,
+        repo_id: Uuid,
+        pr: u64,
+        target: Option<TrainLabel>,
+        queue: &str,
+    ) -> Result<()> {
+        let gh = RepoStore::repo_ref(db, repo_id).await?;
+        client.set_train_label(&gh, pr, target, queue).await?;
+        Ok(())
+    }
+}
+
+/// Queue mutations that mix DB transactions with GitHub side effects. Zero-sized;
+/// all behavior is associated functions taking `db` + a snapshot of the live repo
+/// client (`None` when the App isn't configured).
+#[derive(Debug, Clone, Copy)]
+pub struct QueueOps;
+
+impl QueueOps {
     /// Validate and enqueue a PR into a specific queue — the single enqueue path for
     /// both the dashboard API and the `/mq queue` PR-comment command. Fetches the PR
     /// live to reject one whose base doesn't match the queue (a backport/release PR
     /// must never be merged into the wrong base), enforces the repo-wide PR-open guard
     /// (a PR is open in at most one queue per repo), then assigns its queue position
     /// under a per-queue advisory lock so concurrent enqueues can't collide on order.
-    pub async fn enqueue_pr(&self, queue_id: Uuid, pr: u64, by: &str) -> Result<Enqueued> {
-        let cfg = Store::queue_config(&self.db, queue_id).await?;
-        let gh = Store::repo_ref(&self.db, cfg.repo_id).await?;
-        let Some(client) = self.repo_client.read().await.clone() else {
+    /// Errors when the App isn't configured.
+    pub async fn enqueue_pr(
+        db: &DatabaseConnection,
+        client: Option<Arc<dyn RepoClient>>,
+        queue_id: Uuid,
+        pr: u64,
+        by: &str,
+    ) -> Result<Enqueued> {
+        let cfg = QueueStore::queue_config(db, queue_id).await?;
+        let gh = RepoStore::repo_ref(db, cfg.repo_id).await?;
+        let Some(client) = client else {
             return Err(GitHubError::Other("github app not configured".into()).into());
         };
         let summary = client.pull(&gh, pr).await?;
@@ -160,13 +312,13 @@ impl Runtime {
                 queue_base: cfg.base_branch,
             });
         }
-        if let Some(existing) = Store::open_entry(&self.db, cfg.repo_id, pr).await?
+        if let Some(existing) = EntryStore::open_entry(db, cfg.repo_id, pr).await?
             && existing.queue_id != queue_id
         {
-            let other = Store::queue_config(&self.db, existing.queue_id).await?;
+            let other = QueueStore::queue_config(db, existing.queue_id).await?;
             return Ok(Enqueued::AlreadyQueued { queue: other.name });
         }
-        let txn = self.db.begin().await?;
+        let txn = db.begin().await?;
         let bytes = cfg.repo_id.as_bytes();
         let key = i64::from_le_bytes(bytes[..8].try_into().unwrap())
             ^ i64::from_le_bytes(bytes[8..].try_into().unwrap());
@@ -176,14 +328,15 @@ impl Runtime {
             [Value::from(key)],
         ))
         .await?;
-        if let Some(existing) = Store::open_entry(&txn, cfg.repo_id, pr).await?
+        if let Some(existing) = EntryStore::open_entry(&txn, cfg.repo_id, pr).await?
             && existing.queue_id != queue_id
         {
-            let other = Store::queue_config(&self.db, existing.queue_id).await?;
+            let other = QueueStore::queue_config(db, existing.queue_id).await?;
             return Ok(Enqueued::AlreadyQueued { queue: other.name });
         }
-        let entry = Store::enqueue(&txn, cfg.repo_id, queue_id, pr, &summary.head_sha, by).await?;
-        let position = Store::queue_rank(&txn, queue_id, entry.position).await? as i32;
+        let entry =
+            EntryStore::enqueue(&txn, cfg.repo_id, queue_id, pr, &summary.head_sha, by).await?;
+        let position = EntryStore::queue_rank(&txn, queue_id, entry.position).await? as i32;
         txn.commit().await?;
         let warn_no_checks = cfg.required_checks.is_empty();
         let mut comment = format!(
@@ -193,9 +346,9 @@ impl Runtime {
         if warn_no_checks {
             comment.push_str(" · ⚠️ no required checks configured (held)");
         }
-        let _ = self.comment(cfg.repo_id, pr, &comment).await;
+        let _ = RepoOps::comment(db, client.as_ref(), cfg.repo_id, pr, &comment).await;
         let _ = client
-            .set_train_label(&gh, pr, Some(TrainLabel::Queued))
+            .set_train_label(&gh, pr, Some(TrainLabel::Queued), &cfg.name)
             .await;
         Ok(Enqueued::Ok {
             entry,
@@ -204,44 +357,33 @@ impl Runtime {
         })
     }
 
-    /// Best-effort merge-train label on a PR, set outside the engine loop (dashboard
-    /// dequeue, PR close). `None` clears the label when a PR leaves the train.
-    pub async fn set_pr_label(
-        &self,
-        repo_id: Uuid,
-        pr: u64,
-        target: Option<TrainLabel>,
-    ) -> Result<()> {
-        let Some(client) = self.repo_client.read().await.clone() else {
-            return Ok(());
-        };
-        let gh = Store::repo_ref(&self.db, repo_id).await?;
-        client.set_train_label(&gh, pr, target).await?;
-        Ok(())
-    }
-
     /// Remove a PR from the train whatever its state. A queued entry is just
     /// deleted; a PR testing in — or wedged merging on — the active batch cancels
     /// that batch (drops the staging branch, re-queues its siblings) so the train
     /// rebuilds without it. The one case left untouched is a merge that has already
     /// fast-forwarded base to the staging tip: those PRs are effectively landed and
     /// must not be yanked, so that's reported as `Busy` (also when we can't confirm,
-    /// to fail safe).
-    pub async fn force_dequeue(&self, entry_id: Uuid) -> Result<Removed> {
-        let Some(entry) = Store::entry(&self.db, entry_id).await? else {
+    /// to fail safe). GitHub side effects are skipped when `client` is `None`.
+    pub async fn force_dequeue(
+        db: &DatabaseConnection,
+        client: Option<Arc<dyn RepoClient>>,
+        entry_id: Uuid,
+    ) -> Result<Removed> {
+        let Some(entry) = EntryStore::entry(db, entry_id).await? else {
             return Ok(Removed::NotQueued);
         };
         let repo_id = entry.repo_id;
         let queue_id = entry.queue_id;
         let pr = entry.pr_number;
+        let cfg = QueueStore::queue_config(db, queue_id).await?;
         match entry.state {
             EntryState::Queued => {
-                if !Store::dequeue(&self.db, queue_id, entry_id).await? {
+                if !EntryStore::dequeue(db, queue_id, entry_id).await? {
                     return Ok(Removed::NotQueued);
                 }
             }
             EntryState::Testing => {
-                let Some(batch) = Store::active_batch_view(&self.db, queue_id).await? else {
+                let Some(batch) = BatchStore::active_batch_view(db, queue_id).await? else {
                     return Ok(Removed::NotQueued);
                 };
                 let entry_ids = batch.entry_ids();
@@ -250,10 +392,9 @@ impl Runtime {
                 }
                 if matches!(batch.state, BatchState::Merging) {
                     let staging_sha = batch.staging_sha.clone().unwrap_or_default();
-                    let landed = match self.repo_client.read().await.clone() {
+                    let landed = match &client {
                         Some(client) => {
-                            let cfg = Store::queue_config(&self.db, queue_id).await?;
-                            let gh = Store::repo_ref(&self.db, repo_id).await?;
+                            let gh = RepoStore::repo_ref(db, repo_id).await?;
                             client
                                 .base_sha(&gh, &cfg.base_branch)
                                 .await
@@ -271,100 +412,98 @@ impl Runtime {
                     .copied()
                     .filter(|id| *id != entry_id)
                     .collect();
-                if let Some(client) = self.repo_client.read().await.clone() {
-                    let gh = Store::repo_ref(&self.db, repo_id).await?;
+                if let Some(client) = &client {
+                    let gh = RepoStore::repo_ref(db, repo_id).await?;
                     let _ = client.delete_ref(&gh, &batch.staging_ref).await;
                     let _ = client.delete_ref(&gh, &batch.assembly_ref()).await;
                 }
-                let txn = self.db.begin().await?;
-                Store::remove_entry(&txn, queue_id, entry_id).await?;
-                Store::requeue_entries(&txn, &others).await?;
-                Store::set_batch_state(&txn, batch.id, BatchState::Superseded).await?;
-                Store::append_ledger(&txn, &LedgerRecord::removed(&batch, pr)).await?;
+                let txn = db.begin().await?;
+                EntryStore::remove_entry(&txn, queue_id, entry_id).await?;
+                EntryStore::requeue_entries(&txn, &others).await?;
+                BatchStore::set_batch_state(&txn, batch.id, BatchState::Superseded).await?;
+                LedgerStore::append_ledger(&txn, &LedgerRecord::removed(&batch, pr)).await?;
                 txn.commit().await?;
-                for opr in Store::entry_prs(&self.db, &others)
-                    .await
-                    .unwrap_or_default()
-                {
-                    let _ = self
-                        .set_pr_label(repo_id, opr, Some(TrainLabel::Queued))
+                let sibling_prs = EntryStore::entry_prs(db, &others).await.unwrap_or_default();
+                if let Some(client) = &client {
+                    for opr in sibling_prs {
+                        let _ = RepoOps::set_pr_label(
+                            db,
+                            client.as_ref(),
+                            repo_id,
+                            opr,
+                            Some(TrainLabel::Queued),
+                            &cfg.name,
+                        )
                         .await;
+                    }
                 }
             }
             EntryState::Merged | EntryState::Ejected => {
                 return Ok(Removed::NotQueued);
             }
         }
-        let _ = self
-            .comment(repo_id, pr, "**mergequeue** · removed from the train")
+        if let Some(client) = &client {
+            let _ = RepoOps::comment(
+                db,
+                client.as_ref(),
+                repo_id,
+                pr,
+                "**mergequeue** · removed from the train",
+            )
             .await;
-        let _ = self.set_pr_label(repo_id, pr, None).await;
+            let _ = RepoOps::set_pr_label(db, client.as_ref(), repo_id, pr, None, &cfg.name).await;
+        }
         Ok(Removed::Gone { pr })
     }
+}
 
-    /// Resolve credentials and (re)build the engine + webhook secret. Returns
-    /// whether the App is now configured. Idempotent; called at startup and again
-    /// from the `/setup` callback so registration takes effect without a restart.
-    pub async fn reinit(&self) -> Result<bool> {
-        let Some(creds) = resolve_credentials(&self.cfg, &self.db).await? else {
-            return Ok(false);
-        };
-        let secret = SecretString::new(creds.webhook_secret.clone().into_boxed_str());
-        let app_client = AppClient::from_credentials(creds)?;
-        let repo_client: Arc<dyn RepoClient> = Arc::new(GitHubRepoClient::new(app_client.clone()));
-        let engine = Arc::new(Engine::new(repo_client.clone(), self.db.clone()));
-        *self.engine.write().await = Some(engine);
-        *self.webhook_secret.write().await = Some(secret);
-        *self.app.write().await = Some(app_client);
-        *self.repo_client.write().await = Some(repo_client);
-        *self.app_owner.write().await = None;
-        Ok(true)
-    }
+/// Installation/repo reconciliation against the App API. Zero-sized; all behavior
+/// is associated functions taking `db`, the `app` client, and a snapshot of the
+/// live repo client.
+#[derive(Debug, Clone, Copy)]
+pub struct Sync;
 
+impl Sync {
     /// Reconcile installations + their repos from the App API — a backfill for any
     /// missed `installation`/`installation_repositories` webhook, so an installed
-    /// repo always appears (including after a downtime install). Idempotent.
-    pub async fn sync_installations(&self) -> Result<()> {
-        let Some(app) = self.app.read().await.clone() else {
-            return Ok(());
-        };
-        // Snapshot the moment before fetching: pruning only removes rows that predate
-        // this, so anything a webhook provisions concurrently is never deleted.
+    /// repo always appears (including after a downtime install). Idempotent. The
+    /// `Utc::now()` snapshot is taken before fetching so pruning only removes rows
+    /// that predate it — anything a webhook provisions concurrently is never deleted.
+    pub async fn sync_installations(
+        db: &DatabaseConnection,
+        app: &AppClient,
+        repo_client: Option<Arc<dyn RepoClient>>,
+    ) -> Result<()> {
         let snapshot = Utc::now().fixed_offset();
-        let repo_client = self.repo_client.read().await.clone();
-        let installs = Self::fetch_installations(&app).await?;
+        let installs = Self::fetch_installations(app).await?;
         let mut keep_installations: Vec<i64> = Vec::with_capacity(installs.len());
         for inst in &installs {
-            Store::provision_installation(&self.db, inst.id, &inst.account.login).await?;
+            InstallationStore::provision_installation(db, inst.id, &inst.account.login).await?;
             keep_installations.push(inst.id);
-            let repos = Self::fetch_repos(&app, inst.id).await?;
+            let repos = Self::fetch_repos(app, inst.id).await?;
             let mut keep_repos: Vec<String> = Vec::with_capacity(repos.len());
             for repo in &repos {
-                Store::upsert_repo(&self.db, inst.id, &repo.owner.login, &repo.name).await?;
+                RepoStore::upsert_repo(db, inst.id, &repo.owner.login, &repo.name).await?;
                 keep_repos.push(repo.name.clone());
                 let Some(repo_id) =
-                    Store::repo_id_by_name(&self.db, &repo.owner.login, &repo.name).await?
+                    RepoStore::repo_id_by_name(db, &repo.owner.login, &repo.name).await?
                 else {
                     continue;
                 };
-                let default_queue =
-                    Store::get_or_create_queue(&self.db, repo_id, "default").await?;
-                Store::set_queue_base_branch(&self.db, default_queue, &repo.default_branch).await?;
+                let default_queue = QueueStore::get_or_create_queue(db, repo_id, "default").await?;
+                QueueStore::set_queue_base_branch(db, default_queue, &repo.default_branch).await?;
                 if let Some(client) = &repo_client {
                     let gh = RepoId {
                         owner: repo.owner.login.clone(),
                         name: repo.name.clone(),
                         installation_id: inst.id as u64,
                     };
-                    Self::reconcile_required_checks(&self.db, client.as_ref(), &gh, repo_id)
-                        .await?;
+                    Self::reconcile_required_checks(db, client.as_ref(), &gh, repo_id).await?;
                 }
             }
-            // drop repos this installation no longer grants access to.
-            Store::prune_installation_repos(&self.db, inst.id, &keep_repos, snapshot).await?;
+            InstallationStore::prune_installation_repos(db, inst.id, &keep_repos, snapshot).await?;
         }
-        // drop installations the App was removed from (cascades their repos).
-        Store::prune_installations(&self.db, &keep_installations, snapshot).await?;
+        InstallationStore::prune_installations(db, &keep_installations, snapshot).await?;
         Ok(())
     }
 
@@ -374,15 +513,15 @@ impl Runtime {
     /// keep their own base. Only overwrite on a successful read, so a transient API
     /// error never wipes a queue's checks — an empty set holds the queue (the safety
     /// guard, not a misconfiguration).
-    async fn reconcile_required_checks(
+    pub async fn reconcile_required_checks(
         db: &DatabaseConnection,
         client: &dyn RepoClient,
         gh: &RepoId,
         repo_id: Uuid,
     ) -> Result<()> {
-        for q in Store::list_queues(db, repo_id).await? {
+        for q in QueueStore::list_queues(db, repo_id).await? {
             match client.required_checks(gh, &q.base_branch).await {
-                Ok(checks) => Store::set_queue_required_checks(db, q.id, &checks).await?,
+                Ok(checks) => QueueStore::set_queue_required_checks(db, q.id, &checks).await?,
                 Err(e) => tracing::warn!(
                     error = %e,
                     repo = %format!("{}/{}", gh.owner, gh.name),
@@ -435,6 +574,51 @@ impl Runtime {
         }
         Ok(all)
     }
+}
+
+/// GitHub App lifecycle: identify the owning account and build the client/engine
+/// components from credentials. Zero-sized; all behavior is associated functions.
+/// The hot-swap cells stay on [`Runtime`] — these functions return plain values.
+#[derive(Debug, Clone, Copy)]
+pub struct AppManagement;
+
+impl AppManagement {
+    /// Fetch the owning account from `GET /app` (login + whether it's an org). The
+    /// caching into the runtime cell is the [`Runtime::app_owner`] facade's job.
+    pub async fn fetch_owner(app: &AppClient) -> Option<AppOwner> {
+        let info: AppInfo = app.app().get("/app", None::<&()>).await.ok()?;
+        Some(AppOwner {
+            is_org: info.owner.kind == "Organization",
+            login: info.owner.login,
+        })
+    }
+
+    /// Build the engine + webhook secret + clients from resolved credentials. The
+    /// caller swaps these into the hot-swap cells (see [`Runtime::reinit`]).
+    pub fn build_components(
+        creds: AppCredentials,
+        db: &DatabaseConnection,
+    ) -> Result<AppComponents> {
+        let secret = SecretString::new(creds.webhook_secret.clone().into_boxed_str());
+        let app = AppClient::from_credentials(creds)?;
+        let repo_client: Arc<dyn RepoClient> = Arc::new(GitHubRepoClient::new(app.clone()));
+        let engine = Arc::new(Engine::new(repo_client.clone(), db.clone()));
+        Ok(AppComponents {
+            engine,
+            secret,
+            app,
+            repo_client,
+        })
+    }
+}
+
+/// The freshly-built runtime components produced by [`AppManagement::build_components`],
+/// ready to be swapped into [`Runtime`]'s hot-swap cells.
+pub struct AppComponents {
+    engine: Arc<Engine>,
+    secret: SecretString,
+    app: AppClient,
+    repo_client: Arc<dyn RepoClient>,
 }
 
 /// Outcome of an enqueue attempt, shared by the dashboard API and the PR-comment
@@ -528,11 +712,11 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, Statement};
     use tokio::sync::Mutex as AsyncMutex;
 
-    use super::Runtime;
+    use super::Sync;
     use crate::github::{
         CheckState, GitHubError, MergeOutcome, PullSummary, RepoClient, RepoId, RepoPermission,
     };
-    use crate::store::Store;
+    use crate::store::{InstallationStore, QueueStore, RepoStore};
 
     /// Serializes DB tests against the shared test database.
     static DB_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
@@ -654,27 +838,27 @@ mod tests {
     async fn test_runtime_reconcile_uses_each_queues_own_base() {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
-        Store::provision_installation(&db, 91, "acme")
+        InstallationStore::provision_installation(&db, 91, "acme")
             .await
             .unwrap();
-        Store::upsert_repo(&db, 91, "acme", "widgets")
+        RepoStore::upsert_repo(&db, 91, "acme", "widgets")
             .await
             .unwrap();
-        let repo_id = Store::repo_id_by_name(&db, "acme", "widgets")
-            .await
-            .unwrap()
-            .unwrap();
-        let default_id = Store::queue_id_by_name(&db, repo_id, "default")
+        let repo_id = RepoStore::repo_id_by_name(&db, "acme", "widgets")
             .await
             .unwrap()
             .unwrap();
-        Store::set_queue_base_branch(&db, default_id, "main")
+        let default_id = QueueStore::queue_id_by_name(&db, repo_id, "default")
+            .await
+            .unwrap()
+            .unwrap();
+        QueueStore::set_queue_base_branch(&db, default_id, "main")
             .await
             .unwrap();
-        let rel_id = Store::get_or_create_queue(&db, repo_id, "release")
+        let rel_id = QueueStore::get_or_create_queue(&db, repo_id, "release")
             .await
             .unwrap();
-        Store::set_queue_base_branch(&db, rel_id, "release")
+        QueueStore::set_queue_base_branch(&db, rel_id, "release")
             .await
             .unwrap();
 
@@ -689,12 +873,12 @@ mod tests {
             name: "widgets".into(),
             installation_id: 91,
         };
-        Runtime::reconcile_required_checks(&db, &fake, &gh, repo_id)
+        Sync::reconcile_required_checks(&db, &fake, &gh, repo_id)
             .await
             .unwrap();
 
         assert_eq!(
-            Store::queue_config(&db, default_id)
+            QueueStore::queue_config(&db, default_id)
                 .await
                 .unwrap()
                 .required_checks,
@@ -702,7 +886,7 @@ mod tests {
             "the default queue reconciles against main"
         );
         assert_eq!(
-            Store::queue_config(&db, rel_id)
+            QueueStore::queue_config(&db, rel_id)
                 .await
                 .unwrap()
                 .required_checks,

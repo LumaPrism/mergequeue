@@ -26,7 +26,7 @@ use super::state::{
     BatchView, DbWrite, Effect, Fact, Flow, GhCall, MergeReport, Observation, State, StepReport,
 };
 use crate::github::{RepoClient, RepoId};
-use crate::store::Store;
+use crate::store::{BatchStore, EntryStore, LedgerStore, QueueStore, RepoStore};
 
 pub struct Engine {
     repo: Arc<dyn RepoClient>,
@@ -37,13 +37,6 @@ pub struct Engine {
     locks: Arc<Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>>,
 }
 
-/// A loose bound on micro-loop steps per tick: reset, two per PR (merge-emit and
-/// mark), the state hops, and slack. Hitting it means a transition emitted
-/// `Continue` without progress — error out rather than spin forever.
-fn step_budget(batch_size: usize) -> usize {
-    batch_size * 4 + 16
-}
-
 impl Engine {
     pub fn new(repo: Arc<dyn RepoClient>, db: DatabaseConnection) -> Self {
         Self {
@@ -51,6 +44,13 @@ impl Engine {
             db,
             locks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// A loose bound on micro-loop steps per tick: reset, two per PR (merge-emit and
+    /// mark), the state hops, and slack. Hitting it means a transition emitted
+    /// `Continue` without progress — error out rather than spin forever.
+    fn step_budget(batch_size: usize) -> usize {
+        batch_size * 4 + 16
     }
 
     fn queue_lock(&self, queue_id: Uuid) -> Arc<AsyncMutex<()>> {
@@ -68,9 +68,9 @@ impl Engine {
     pub async fn tick(&self, queue_id: Uuid) -> Result<TickOutcome, EngineError> {
         let lock = self.queue_lock(queue_id);
         let _guard = lock.lock().await;
-        let cfg = Store::queue_config(&self.db, queue_id).await?;
+        let cfg = QueueStore::queue_config(&self.db, queue_id).await?;
         let mut last: Option<StepReport> = None;
-        for _ in 0..step_budget(cfg.batch_size) {
+        for _ in 0..Self::step_budget(cfg.batch_size) {
             let obs = self.observe(&cfg, last.take()).await?;
             let decision = State::decide(&cfg, &obs);
             last = self.interpret(&cfg, decision.effects).await?;
@@ -91,9 +91,9 @@ impl Engine {
         if cfg.required_checks.is_empty() {
             return Ok(Observation::Blocked);
         }
-        let gh = Store::repo_ref(&self.db, cfg.repo_id).await?;
-        let Some(batch) = Store::active_batch_view(&self.db, cfg.queue_id).await? else {
-            let queued = Store::next_queued(&self.db, cfg.queue_id, cfg.batch_size)
+        let gh = RepoStore::repo_ref(&self.db, cfg.repo_id).await?;
+        let Some(batch) = BatchStore::active_batch_view(&self.db, cfg.queue_id).await? else {
+            let queued = BatchStore::next_queued(&self.db, cfg.queue_id, cfg.batch_size)
                 .await?
                 .into_iter()
                 .map(|e| e.id)
@@ -192,7 +192,7 @@ impl Engine {
         cfg: &RepoQueueConfig,
         effects: Vec<Effect>,
     ) -> Result<Option<StepReport>, EngineError> {
-        let gh = Store::repo_ref(&self.db, cfg.repo_id).await?;
+        let gh = RepoStore::repo_ref(&self.db, cfg.repo_id).await?;
         let mut report = None;
         for eff in effects {
             match eff {
@@ -204,7 +204,7 @@ impl Engine {
                     txn.commit().await?;
                 }
                 Effect::Gh(call) => {
-                    if let Some(r) = self.apply_gh(&gh, call).await? {
+                    if let Some(r) = self.apply_gh(&gh, &cfg.name, call).await? {
                         report = Some(r);
                     }
                 }
@@ -224,28 +224,30 @@ impl Engine {
                 queue_id,
                 entry_ids,
                 staging_ref,
-            } => Store::create_batch(c, repo_id, queue_id, &entry_ids, &staging_ref).await?,
+            } => BatchStore::create_batch(c, repo_id, queue_id, &entry_ids, &staging_ref).await?,
             DbWrite::SetBatchBaseSha { batch_id, base_sha } => {
-                Store::set_batch_base_sha(c, batch_id, &base_sha).await?
+                BatchStore::set_batch_base_sha(c, batch_id, &base_sha).await?
             }
             DbWrite::MarkEntryStaged { batch_id, entry_id } => {
-                Store::mark_entry_staged(c, batch_id, entry_id).await?
+                BatchStore::mark_entry_staged(c, batch_id, entry_id).await?
             }
             DbWrite::SetBatchStaged {
                 batch_id,
                 staging_sha,
-            } => Store::set_batch_staged(c, batch_id, &staging_sha).await?,
+            } => BatchStore::set_batch_staged(c, batch_id, &staging_sha).await?,
             DbWrite::SetBatchState { batch_id, state } => {
-                Store::set_batch_state(c, batch_id, state).await?
+                BatchStore::set_batch_state(c, batch_id, state).await?
             }
             DbWrite::SetMergeBlocked { batch_id, blocked } => {
-                Store::set_merge_blocked(c, batch_id, blocked).await?
+                BatchStore::set_merge_blocked(c, batch_id, blocked).await?
             }
             DbWrite::SetEntriesState { entry_ids, state } => {
-                Store::set_entries_state(c, &entry_ids, state).await?
+                EntryStore::set_entries_state(c, &entry_ids, state).await?
             }
-            DbWrite::RequeueEntries { entry_ids } => Store::requeue_entries(c, &entry_ids).await?,
-            DbWrite::AppendLedger(record) => Store::append_ledger(c, &record).await?,
+            DbWrite::RequeueEntries { entry_ids } => {
+                EntryStore::requeue_entries(c, &entry_ids).await?
+            }
+            DbWrite::AppendLedger(record) => LedgerStore::append_ledger(c, &record).await?,
         }
         Ok(())
     }
@@ -256,7 +258,12 @@ impl Engine {
     /// its assembly ref is missing (a batch staged by the pre-assembly-ref engine)
     /// seeds that ref from the in-flight staging ref and retries once. The rest are
     /// best-effort.
-    async fn apply_gh(&self, gh: &RepoId, call: GhCall) -> Result<Option<StepReport>, EngineError> {
+    async fn apply_gh(
+        &self,
+        gh: &RepoId,
+        queue: &str,
+        call: GhCall,
+    ) -> Result<Option<StepReport>, EngineError> {
         match call {
             GhCall::ForceRef { staging_ref, sha } => {
                 self.repo.force_ref(gh, &staging_ref, &sha).await?;
@@ -314,7 +321,7 @@ impl Engine {
                 Ok(None)
             }
             GhCall::SetLabel { pr, target } => {
-                let _ = self.repo.set_train_label(gh, pr, target).await;
+                let _ = self.repo.set_train_label(gh, pr, target, queue).await;
                 Ok(None)
             }
         }
@@ -337,7 +344,7 @@ mod tests {
         TrainLabel,
     };
     use crate::queue::{BatchState, TickOutcome};
-    use crate::store::Store;
+    use crate::store::{BatchStore, EntryStore, InstallationStore, QueueStore, RepoStore};
     use migration::{Migrator, MigratorTrait};
 
     /// Serializes DB tests against the shared test database.
@@ -538,13 +545,17 @@ mod tests {
     /// Seed a repo with a `default` queue and return `(repo_id, queue_id)`. The
     /// queue's `batch_size` + required checks are set so the engine isn't held.
     async fn seed_repo(db: &DatabaseConnection, batch_size: i32) -> (Uuid, Uuid) {
-        Store::provision_installation(db, 42, "acme").await.unwrap();
-        Store::upsert_repo(db, 42, "acme", "widgets").await.unwrap();
-        let repo_id = Store::repo_id_by_name(db, "acme", "widgets")
+        InstallationStore::provision_installation(db, 42, "acme")
+            .await
+            .unwrap();
+        RepoStore::upsert_repo(db, 42, "acme", "widgets")
+            .await
+            .unwrap();
+        let repo_id = RepoStore::repo_id_by_name(db, "acme", "widgets")
             .await
             .unwrap()
             .unwrap();
-        let queue_id = Store::queue_id_by_name(db, repo_id, "default")
+        let queue_id = QueueStore::queue_id_by_name(db, repo_id, "default")
             .await
             .unwrap()
             .unwrap();
@@ -565,7 +576,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 101, "h101", "alice")
+        EntryStore::enqueue(&db, repo_id, queue_id, 101, "h101", "alice")
             .await
             .unwrap();
 
@@ -576,7 +587,12 @@ mod tests {
         let out = engine.tick(queue_id).await.unwrap();
 
         assert_eq!(out, TickOutcome::Merged { prs: vec![101] });
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let calls = fake.calls();
         assert!(calls.iter().any(|c| c.starts_with("force_ref")));
         assert!(
@@ -585,7 +601,12 @@ mod tests {
                 .any(|c| c == "merge_onto mq-tmp/staging/default/main head101")
         );
         assert!(calls.iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::list_entries(&db, queue_id).await.unwrap().is_empty());
+        assert!(
+            EntryStore::list_entries(&db, queue_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -593,7 +614,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 101, "h101", "alice")
+        EntryStore::enqueue(&db, repo_id, queue_id, 101, "h101", "alice")
             .await
             .unwrap();
 
@@ -650,7 +671,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 202, "h202", "bob")
+        EntryStore::enqueue(&db, repo_id, queue_id, 202, "h202", "bob")
             .await
             .unwrap();
 
@@ -662,7 +683,12 @@ mod tests {
 
         assert_eq!(out, TickOutcome::Ejected { pr: 202 });
         assert!(fake.calls().iter().any(|c| c == "comment 202"));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -670,7 +696,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 818, "h818", "ivy")
+        EntryStore::enqueue(&db, repo_id, queue_id, 818, "h818", "ivy")
             .await
             .unwrap();
 
@@ -683,7 +709,12 @@ mod tests {
 
         assert_eq!(out, TickOutcome::Waiting);
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_some());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -691,7 +722,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 707, "h707", "gwen")
+        EntryStore::enqueue(&db, repo_id, queue_id, 707, "h707", "gwen")
             .await
             .unwrap();
 
@@ -699,8 +730,11 @@ mod tests {
         let engine = Engine::new(fake.clone(), db.clone());
 
         engine.tick(queue_id).await.unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
-        Store::set_batch_state(&db, batch.id, BatchState::Merging)
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        BatchStore::set_batch_state(&db, batch.id, BatchState::Merging)
             .await
             .unwrap();
         fake.refs
@@ -713,10 +747,10 @@ mod tests {
         let calls = fake.calls();
         let testing = calls
             .iter()
-            .position(|c| c == "add_labels 707 merge-queue: testing");
+            .position(|c| c == "add_labels 707 merge-queue (default): testing");
         let queued = calls
             .iter()
-            .position(|c| c == "add_labels 707 merge-queue: queued");
+            .position(|c| c == "add_labels 707 merge-queue (default): queued");
         assert!(
             testing.is_some(),
             "PR should be labelled testing when staged"
@@ -726,11 +760,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_engine_label_is_queue_scoped() {
+        let fake = Fake::new(CheckState::Success);
+        let gh = RepoId {
+            owner: "acme".into(),
+            name: "widgets".into(),
+            installation_id: 42,
+        };
+
+        fake.set_train_label(&gh, 700, Some(TrainLabel::Testing), "frontend")
+            .await
+            .unwrap();
+
+        let calls = fake.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "add_labels 700 merge-queue (frontend): testing"),
+            "the applied label encodes its queue"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "remove_label 700 merge-queue (frontend): queued"),
+            "sibling variants are cleared scoped to THIS queue"
+        );
+        assert!(
+            !calls.iter().any(|c| c.contains("merge-queue (default)")),
+            "another queue's label variants are never touched"
+        );
+    }
+
+    #[tokio::test]
     async fn test_engine_holds_a_pending_batch() {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 303, "h303", "carol")
+        EntryStore::enqueue(&db, repo_id, queue_id, 303, "h303", "carol")
             .await
             .unwrap();
 
@@ -741,7 +807,12 @@ mod tests {
         let out = engine.tick(queue_id).await.unwrap();
 
         assert_eq!(out, TickOutcome::Waiting);
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_some());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -749,10 +820,10 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::set_queue_required_checks(&db, queue_id, &[])
+        QueueStore::set_queue_required_checks(&db, queue_id, &[])
             .await
             .unwrap();
-        Store::enqueue(&db, repo_id, queue_id, 404, "h404", "dave")
+        EntryStore::enqueue(&db, repo_id, queue_id, 404, "h404", "dave")
             .await
             .unwrap();
 
@@ -762,9 +833,17 @@ mod tests {
         let out = engine.tick(queue_id).await.unwrap();
 
         assert_eq!(out, TickOutcome::BlockedNoChecks);
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(fake.calls().is_empty());
-        assert_eq!(Store::list_entries(&db, queue_id).await.unwrap().len(), 1);
+        assert_eq!(
+            EntryStore::list_entries(&db, queue_id).await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -772,7 +851,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 505, "h505", "erin")
+        EntryStore::enqueue(&db, repo_id, queue_id, 505, "h505", "erin")
             .await
             .unwrap();
 
@@ -784,8 +863,18 @@ mod tests {
         assert_eq!(out, TickOutcome::Ejected { pr: 505 });
         assert!(fake.calls().iter().any(|c| c == "comment 505"));
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
-        assert!(Store::list_entries(&db, queue_id).await.unwrap().is_empty());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EntryStore::list_entries(&db, queue_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -793,7 +882,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 111, "h111", "judy")
+        EntryStore::enqueue(&db, repo_id, queue_id, 111, "h111", "judy")
             .await
             .unwrap();
 
@@ -805,8 +894,18 @@ mod tests {
         assert_eq!(out, TickOutcome::Ejected { pr: 111 });
         assert!(fake.calls().iter().any(|c| c == "comment 111"));
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
-        assert!(Store::list_entries(&db, queue_id).await.unwrap().is_empty());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EntryStore::list_entries(&db, queue_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -814,7 +913,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 606, "h606", "frank")
+        EntryStore::enqueue(&db, repo_id, queue_id, 606, "h606", "frank")
             .await
             .unwrap();
 
@@ -822,8 +921,11 @@ mod tests {
         let engine = Engine::new(fake.clone(), db.clone());
 
         engine.tick(queue_id).await.unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
-        Store::set_batch_state(&db, batch.id, BatchState::Merging)
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        BatchStore::set_batch_state(&db, batch.id, BatchState::Merging)
             .await
             .unwrap();
         fake.refs
@@ -835,8 +937,13 @@ mod tests {
 
         assert_eq!(out, TickOutcome::Restaged);
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
-        let open = Store::list_entries(&db, queue_id).await.unwrap();
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let open = EntryStore::list_entries(&db, queue_id).await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].pr_number, 606);
     }
@@ -846,7 +953,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 707, "h707", "grace")
+        EntryStore::enqueue(&db, repo_id, queue_id, 707, "h707", "grace")
             .await
             .unwrap();
 
@@ -854,12 +961,15 @@ mod tests {
         let engine = Engine::new(fake.clone(), db.clone());
 
         engine.tick(queue_id).await.unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
         let staging_sha = batch.staging_sha.clone().unwrap();
         // Simulate a crash after fast_forward landed: base already == staging tip,
         // batch still persisted as Merging.
         fake.refs.lock().unwrap().insert("main".into(), staging_sha);
-        Store::set_batch_state(&db, batch.id, BatchState::Merging)
+        BatchStore::set_batch_state(&db, batch.id, BatchState::Merging)
             .await
             .unwrap();
 
@@ -867,8 +977,18 @@ mod tests {
 
         assert_eq!(out, TickOutcome::Merged { prs: vec![707] });
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_none());
-        assert!(Store::list_entries(&db, queue_id).await.unwrap().is_empty());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            EntryStore::list_entries(&db, queue_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -876,7 +996,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 808, "h808", "heidi")
+        EntryStore::enqueue(&db, repo_id, queue_id, 808, "h808", "heidi")
             .await
             .unwrap();
 
@@ -889,7 +1009,12 @@ mod tests {
 
         assert_eq!(out, TickOutcome::Waiting);
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_some());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -897,7 +1022,7 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        Store::enqueue(&db, repo_id, queue_id, 909, "h909", "ivan")
+        EntryStore::enqueue(&db, repo_id, queue_id, 909, "h909", "ivan")
             .await
             .unwrap();
 
@@ -913,7 +1038,12 @@ mod tests {
             "lint reported but the required `ci` never did → hold, never an ungated merge"
         );
         assert!(!fake.calls().iter().any(|c| c.starts_with("fast_forward")));
-        assert!(Store::active_batch(&db, queue_id).await.unwrap().is_some());
+        assert!(
+            BatchStore::active_batch(&db, queue_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -921,10 +1051,10 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        let entry = Store::enqueue(&db, repo_id, queue_id, 314, "h314", "pi")
+        let entry = EntryStore::enqueue(&db, repo_id, queue_id, 314, "h314", "pi")
             .await
             .unwrap();
-        Store::create_batch(
+        BatchStore::create_batch(
             &db,
             repo_id,
             queue_id,
@@ -933,11 +1063,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
-        Store::set_batch_base_sha(&db, batch.id, "base000")
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        BatchStore::set_batch_base_sha(&db, batch.id, "base000")
             .await
             .unwrap();
-        Store::mark_entry_staged(&db, batch.id, entry.id)
+        BatchStore::mark_entry_staged(&db, batch.id, entry.id)
             .await
             .unwrap();
 
@@ -966,13 +1099,13 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 2).await;
-        let a = Store::enqueue(&db, repo_id, queue_id, 401, "h401", "ann")
+        let a = EntryStore::enqueue(&db, repo_id, queue_id, 401, "h401", "ann")
             .await
             .unwrap();
-        let b = Store::enqueue(&db, repo_id, queue_id, 402, "h402", "bo")
+        let b = EntryStore::enqueue(&db, repo_id, queue_id, 402, "h402", "bo")
             .await
             .unwrap();
-        Store::create_batch(
+        BatchStore::create_batch(
             &db,
             repo_id,
             queue_id,
@@ -981,11 +1114,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
-        Store::set_batch_base_sha(&db, batch.id, "base000")
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        BatchStore::set_batch_base_sha(&db, batch.id, "base000")
             .await
             .unwrap();
-        Store::mark_entry_staged(&db, batch.id, a.id).await.unwrap();
+        BatchStore::mark_entry_staged(&db, batch.id, a.id)
+            .await
+            .unwrap();
 
         let fake = std::sync::Arc::new(Fake::new(CheckState::Pending));
         fake.refs.lock().unwrap().insert(
@@ -1018,10 +1156,10 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, queue_id) = seed_repo(&db, 1).await;
-        let entry = Store::enqueue(&db, repo_id, queue_id, 271, "h271", "quinn")
+        let entry = EntryStore::enqueue(&db, repo_id, queue_id, 271, "h271", "quinn")
             .await
             .unwrap();
-        Store::create_batch(
+        BatchStore::create_batch(
             &db,
             repo_id,
             queue_id,
@@ -1030,8 +1168,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let batch = Store::active_batch(&db, queue_id).await.unwrap().unwrap();
-        Store::set_batch_base_sha(&db, batch.id, "base000")
+        let batch = BatchStore::active_batch(&db, queue_id)
+            .await
+            .unwrap()
+            .unwrap();
+        BatchStore::set_batch_base_sha(&db, batch.id, "base000")
             .await
             .unwrap();
 
@@ -1064,13 +1205,13 @@ mod tests {
         let _guard = DB_LOCK.lock().await;
         let db = test_db().await;
         let (repo_id, default_id) = seed_repo(&db, 1).await;
-        let fe_id = Store::get_or_create_queue(&db, repo_id, "frontend")
+        let fe_id = QueueStore::get_or_create_queue(&db, repo_id, "frontend")
             .await
             .unwrap();
-        Store::enqueue(&db, repo_id, default_id, 101, "h101", "alice")
+        EntryStore::enqueue(&db, repo_id, default_id, 101, "h101", "alice")
             .await
             .unwrap();
-        Store::enqueue(&db, repo_id, fe_id, 202, "h202", "bob")
+        EntryStore::enqueue(&db, repo_id, fe_id, 202, "h202", "bob")
             .await
             .unwrap();
 
@@ -1085,12 +1226,17 @@ mod tests {
         assert_eq!(out_default, TickOutcome::Merged { prs: vec![101] });
         assert_eq!(out_frontend, TickOutcome::Merged { prs: vec![202] });
         assert!(
-            Store::active_batch(&db, default_id)
+            BatchStore::active_batch(&db, default_id)
                 .await
                 .unwrap()
                 .is_none()
         );
-        assert!(Store::active_batch(&db, fe_id).await.unwrap().is_none());
+        assert!(
+            BatchStore::active_batch(&db, fe_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             fake.calls()
                 .iter()

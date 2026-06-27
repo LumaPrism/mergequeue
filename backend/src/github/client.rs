@@ -68,14 +68,17 @@ impl TrainLabel {
     /// Every managed label — used to clear the others when state changes.
     pub const ALL: [TrainLabel; 4] = [Self::Queued, Self::Testing, Self::Blocked, Self::Ejected];
 
-    /// The label text as it appears on the PR.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Queued => "merge-queue: queued",
-            Self::Testing => "merge-queue: testing",
-            Self::Blocked => "merge-queue: blocked",
-            Self::Ejected => "merge-queue: ejected",
-        }
+    /// The label text as it appears on the PR, scoped to its queue:
+    /// `merge-queue (<queue>): <state>`. Every queue gets its own label variants so a
+    /// PR's label says which named queue it's on.
+    pub fn name(self, queue: &str) -> String {
+        let state = match self {
+            Self::Queued => "queued",
+            Self::Testing => "testing",
+            Self::Blocked => "blocked",
+            Self::Ejected => "ejected",
+        };
+        format!("merge-queue ({queue}): {state}")
     }
 
     /// The label colour (GitHub hex, no leading `#`).
@@ -204,24 +207,26 @@ pub trait RepoClient: Send + Sync {
     /// Remove a label from a PR. A label that isn't present is not an error.
     async fn remove_label(&self, repo: &RepoId, pr: u64, name: &str) -> Result<(), GitHubError>;
 
-    /// Set the PR's merge-train label to `target`, clearing any other managed label;
-    /// `None` removes all of them. The target is added before its siblings are
-    /// removed so the PR never flickers label-less.
+    /// Set the PR's merge-train label for `queue` to `target`, clearing this queue's
+    /// other managed labels; `None` removes all of them. The target is added before
+    /// its siblings are removed so the PR never flickers label-less. Clearing is
+    /// scoped to `queue`'s own label variants, so a PR's labels on other queues are
+    /// untouched.
     async fn set_train_label(
         &self,
         repo: &RepoId,
         pr: u64,
         target: Option<TrainLabel>,
+        queue: &str,
     ) -> Result<(), GitHubError> {
         if let Some(label) = target {
-            self.ensure_label(repo, label.name(), label.color(), label.description())
+            self.ensure_label(repo, &label.name(queue), label.color(), label.description())
                 .await?;
-            self.add_labels(repo, pr, &[label.name().to_owned()])
-                .await?;
+            self.add_labels(repo, pr, &[label.name(queue)]).await?;
         }
         for other in TrainLabel::ALL {
             if Some(other) != target {
-                self.remove_label(repo, pr, other.name()).await?;
+                self.remove_label(repo, pr, &other.name(queue)).await?;
             }
         }
         Ok(())

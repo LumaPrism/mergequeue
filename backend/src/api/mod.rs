@@ -2,28 +2,27 @@
 //! spec + Swagger UI for free. Handlers delegate to the
 //! connection-generic `Store`; the engine runs out of band in the worker.
 
+mod dto;
+mod error;
+
+pub use dto::*;
+pub use error::*;
+
 use std::sync::Arc;
 
-use poem::http::StatusCode;
-use poem::{Error, Result};
+use poem::Result;
+use poem_openapi::OpenApi;
 use poem_openapi::param::{Cookie, Path, Query};
 use poem_openapi::payload::Json;
-use poem_openapi::{Enum, Object, OpenApi};
 use sea_orm::{DatabaseConnection, TransactionTrait};
-use serde::{Deserialize, Serialize};
-use typeshare::typeshare;
 use uuid::Uuid;
 
-use crate::auth::current_user;
+use crate::auth::{current_user, user};
 use crate::config::Config;
 use crate::error::Error as AppError;
-use crate::github::PullSummary;
-use crate::queue::{
-    BatchState, BatchView, EntryState, LedgerEntryResult, LedgerOutcome, QueueEntry,
-};
 use crate::runtime::{AppOwner, Enqueued, Removed, Runtime};
-use crate::setup::resolve_credentials;
-use crate::store::{QueueSummary, RepoSummary, Store, queue_ledger};
+use crate::setup::SetupService;
+use crate::store::{BatchStore, EntryStore, LedgerStore, QueueStore, RepoStore};
 
 pub struct Api {
     pub cfg: Config,
@@ -31,286 +30,13 @@ pub struct Api {
     pub rt: Arc<Runtime>,
 }
 
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct Health {
-    pub status: String,
-}
-
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct EntryView {
-    pub id: String,
-    pub pr_number: u32,
-    pub position: i32,
-    pub status: PrStatus,
-}
-
-/// A PR's place in the merge lifecycle — projected from its entry + batch.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Enum)]
-#[serde(rename_all = "lowercase")]
-#[oai(rename_all = "lowercase")]
-pub enum PrStatus {
-    Queued,
-    Testing,
-    Merging,
-    Blocked,
-    Merged,
-    Ejected,
-}
-
-impl PrStatus {
-    fn of(state: EntryState, batch: Option<&BatchView>) -> Self {
-        match state {
-            EntryState::Queued => Self::Queued,
-            EntryState::Merged => Self::Merged,
-            EntryState::Ejected => Self::Ejected,
-            EntryState::Testing => match batch {
-                Some(b) if b.merge_blocked => Self::Blocked,
-                Some(b) if b.state == BatchState::Merging => Self::Merging,
-                _ => Self::Testing,
-            },
-        }
-    }
-}
-
-impl EntryView {
-    fn project(e: QueueEntry, batch: Option<&BatchView>) -> Self {
-        Self {
-            status: PrStatus::of(e.state, batch),
-            id: e.id.to_string(),
-            pr_number: e.pr_number as u32,
-            position: e.position,
-        }
-    }
-}
-
-/// One PR's fate within a finished batch run, projected from the ledger.
-#[typeshare]
-#[derive(Serialize, Deserialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct LedgerEntryView {
-    #[typeshare(serialized_as = "u32")]
-    pub pr_number: u64,
-    pub result: LedgerEntryResult,
-}
-
-/// One finished batch run from the append-only ledger (the dashboard's history view).
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct LedgerView {
-    pub id: String,
-    pub batch_id: String,
-    pub outcome: LedgerOutcome,
-    pub base_sha: String,
-    pub landed_sha: Option<String>,
-    #[typeshare(serialized_as = "Option<u32>")]
-    pub ejected_pr: Option<u64>,
-    pub entries: Vec<LedgerEntryView>,
-    pub started_at: String,
-    pub ended_at: String,
-}
-
-impl LedgerView {
-    fn project(m: queue_ledger::Model) -> Self {
-        Self {
-            id: m.id.to_string(),
-            batch_id: m.batch_id.to_string(),
-            outcome: m.outcome,
-            base_sha: m.base_sha,
-            landed_sha: m.landed_sha,
-            ejected_pr: m.ejected_pr.map(|p| p as u64),
-            entries: serde_json::from_value(m.entries).unwrap_or_default(),
-            started_at: m.started_at.to_rfc3339(),
-            ended_at: m.ended_at.to_rfc3339(),
-        }
-    }
-}
-
-/// A repo under management, with its named queues (the dashboard's switcher).
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct RepoView {
-    pub id: String,
-    pub owner: String,
-    pub name: String,
-    pub queues: Vec<QueueView>,
-}
-
-impl From<RepoSummary> for RepoView {
-    fn from(r: RepoSummary) -> Self {
-        Self {
-            id: r.id.to_string(),
-            owner: r.owner,
-            name: r.name,
-            queues: r.queues.into_iter().map(QueueView::from).collect(),
-        }
-    }
-}
-
-/// One named queue with its config + live depth. `active` is the active-batch
-/// summary; it's populated by the per-repo queues endpoint and left `None` in the
-/// lightweight repo switcher.
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct QueueView {
-    pub id: String,
-    pub repo_id: String,
-    pub name: String,
-    pub base_branch: String,
-    pub batch_size: i32,
-    pub depth: i32,
-    pub active: Option<ActiveBatchView>,
-}
-
-impl From<QueueSummary> for QueueView {
-    fn from(q: QueueSummary) -> Self {
-        Self {
-            id: q.id.to_string(),
-            repo_id: q.repo_id.to_string(),
-            name: q.name,
-            base_branch: q.base_branch,
-            batch_size: q.batch_size,
-            depth: q.queued as i32,
-            active: None,
-        }
-    }
-}
-
-/// A compact summary of a queue's in-flight batch.
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct ActiveBatchView {
-    pub id: String,
-    pub state: BatchState,
-    #[typeshare(serialized_as = "Vec<u32>")]
-    pub prs: Vec<u64>,
-}
-
-impl ActiveBatchView {
-    fn of(batch: &BatchView) -> Self {
-        Self {
-            id: batch.id.to_string(),
-            state: batch.state,
-            prs: batch.prs(),
-        }
-    }
-}
-
-/// Create a queue: a name plus optional config overriding the repo's default queue.
-#[typeshare]
-#[derive(Deserialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct CreateQueueRequest {
-    pub name: String,
-    pub base_branch: Option<String>,
-    pub batch_size: Option<i32>,
-}
-
-#[typeshare]
-#[derive(Deserialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct EnqueueRequest {
-    pub pr_number: u32,
-}
-
-/// Drag-to-reorder: the queued entry ids in their new order (front of the train first).
-#[typeshare]
-#[derive(Deserialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct ReorderRequest {
-    pub entry_ids: Vec<String>,
-}
-
-/// The signed-in GitHub user, for the dashboard's auth gate.
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct MeView {
-    pub login: String,
-    pub avatar_url: String,
-}
-
-/// An open PR — a candidate to add to the queue.
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct PrView {
-    pub number: u32,
-    pub title: String,
-    pub head_ref: String,
-    pub base_ref: String,
-    pub mergeable: Option<bool>,
-}
-
-impl From<PullSummary> for PrView {
-    fn from(p: PullSummary) -> Self {
-        Self {
-            number: p.number as u32,
-            title: p.title,
-            head_ref: p.head_ref,
-            base_ref: p.base_ref,
-            mergeable: p.mergeable,
-        }
-    }
-}
-
-/// Where the resolved GitHub App credentials came from.
-#[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Enum)]
-#[serde(rename_all = "lowercase")]
-#[oai(rename_all = "lowercase")]
-pub enum SetupSource {
-    /// Static credentials from config/env (the static escape hatch).
-    Config,
-    /// Credentials minted by the `/setup` manifest flow, stored in the DB.
-    Manifest,
-}
-
-/// Whether the GitHub App is registered. Drives the dashboard's setup gate so the
-/// manifest flow is offered only when the App is missing.
-#[typeshare]
-#[derive(Serialize, Object)]
-#[serde(rename_all = "camelCase")]
-#[oai(rename_all = "camelCase")]
-pub struct SetupStatus {
-    pub registered: bool,
-    /// Where to start the manifest flow (always present, used by the "connect" CTA).
-    pub setup_url: String,
-    pub slug: Option<String>,
-    pub install_url: Option<String>,
-    pub manage_url: Option<String>,
-    pub source: Option<SetupSource>,
-}
-
 impl Api {
-    fn parse_repo(raw: &str) -> Result<Uuid> {
-        Uuid::parse_str(raw)
-            .map_err(|_| Error::from_string("invalid repo id", StatusCode::BAD_REQUEST))
+    fn parse_repo(raw: &str) -> Result<Uuid, ApiError> {
+        Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest("invalid repo id".into()))
     }
 
-    fn parse_queue(raw: &str) -> Result<Uuid> {
-        Uuid::parse_str(raw)
-            .map_err(|_| Error::from_string("invalid queue id", StatusCode::BAD_REQUEST))
+    fn parse_queue(raw: &str) -> Result<Uuid, ApiError> {
+        Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest("invalid queue id".into()))
     }
 
     /// A queue name is ref-safe iff it matches `^[a-z0-9][a-z0-9-]*$` — it's folded
@@ -325,26 +51,21 @@ impl Api {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     }
 
-    fn db_err(e: sea_orm::DbErr) -> Error {
-        Error::from_string(e.to_string(), StatusCode::INTERNAL_SERVER_ERROR)
-    }
-
     /// Map an internal enqueue error to a client response without leaking internals:
     /// a GitHub-side failure is a 502, anything else a 500.
-    fn enqueue_err(e: AppError) -> Error {
+    fn enqueue_err(e: AppError) -> ApiError {
         match e {
-            AppError::GitHub(_) => Error::from_string(
-                "could not reach GitHub to validate this PR",
-                StatusCode::BAD_GATEWAY,
-            ),
-            AppError::Config(_) | AppError::Db(_) | AppError::Engine(_) | AppError::Io(_) => {
-                Error::from_string("could not queue this PR", StatusCode::INTERNAL_SERVER_ERROR)
+            AppError::GitHub(_) => {
+                ApiError::BadGateway("could not reach GitHub to validate this PR".into())
             }
+            AppError::Config(_)
+            | AppError::Db(_)
+            | AppError::Engine(_)
+            | AppError::Io(_)
+            | AppError::Crypto(_)
+            | AppError::Open(_)
+            | AppError::ConfigKey(_) => ApiError::Internal("could not queue this PR".into()),
         }
-    }
-
-    fn unauthorized() -> Error {
-        Error::from_string("unauthorized", StatusCode::UNAUTHORIZED)
     }
 
     /// The App's GitHub settings URL, or `None` when the owner is unknown (an unknown
@@ -362,19 +83,22 @@ impl Api {
         })
     }
 
-    /// Require a valid `mq_session` cookie; returns the signed-in user's login.
-    async fn require_session(&self, session: &Cookie<Option<String>>) -> Result<String> {
-        let token = session.0.as_deref().ok_or_else(Self::unauthorized)?;
-        let sid = Uuid::parse_str(token).map_err(|_| Self::unauthorized())?;
-        let user = current_user(&self.db, sid)
+    /// The signed-in user behind a valid `mq_session` cookie, or `Unauthorized`.
+    async fn session_user(
+        &self,
+        session: &Cookie<Option<String>>,
+    ) -> Result<user::Model, ApiError> {
+        let token = session.0.as_deref().ok_or(ApiError::Unauthorized)?;
+        let sid = Uuid::parse_str(token).map_err(|_| ApiError::Unauthorized)?;
+        current_user(&self.db, sid)
             .await
-            .map_err(Self::db_err)?
-            .ok_or_else(Self::unauthorized)?;
-        Ok(user.login)
+            .map_err(ApiError::Db)?
+            .ok_or(ApiError::Unauthorized)
     }
 
-    fn forbidden() -> Error {
-        Error::from_string("forbidden", StatusCode::FORBIDDEN)
+    /// Require a valid `mq_session` cookie; returns the signed-in user's login.
+    async fn require_session(&self, session: &Cookie<Option<String>>) -> Result<String, ApiError> {
+        Ok(self.session_user(session).await?.login)
     }
 
     /// Whether `login` may write `repo_id` — the dashboard's write-authz gate,
@@ -396,10 +120,10 @@ impl Api {
         &self,
         session: &Cookie<Option<String>>,
         repo_id: Uuid,
-    ) -> Result<String> {
+    ) -> Result<String, ApiError> {
         let login = self.require_session(session).await?;
         if !self.can_write_repo(repo_id, &login).await {
-            return Err(Self::forbidden());
+            return Err(ApiError::Forbidden);
         }
         Ok(login)
     }
@@ -410,14 +134,14 @@ impl Api {
         &self,
         session: &Cookie<Option<String>>,
         queue_id: Uuid,
-    ) -> Result<String> {
+    ) -> Result<String, ApiError> {
         let login = self.require_session(session).await?;
-        let repo_id = Store::queue_repo_id(&self.db, queue_id)
+        let repo_id = RepoStore::queue_repo_id(&self.db, queue_id)
             .await
-            .map_err(Self::db_err)?
-            .ok_or_else(|| Error::from_string("unknown queue", StatusCode::NOT_FOUND))?;
+            .map_err(ApiError::Db)?
+            .ok_or_else(|| ApiError::NotFound("unknown queue".into()))?;
         if !self.can_write_repo(repo_id, &login).await {
-            return Err(Self::forbidden());
+            return Err(ApiError::Forbidden);
         }
         Ok(login)
     }
@@ -435,14 +159,21 @@ impl Api {
     /// Is the GitHub App registered yet? The dashboard gates the manifest setup
     /// flow on this so the "connect" button shows only when the App is missing.
     #[oai(path = "/setup/status", method = "get")]
-    async fn setup_status(&self) -> Json<SetupStatus> {
+    async fn setup_status(&self) -> Result<Json<SetupStatus>> {
         let setup_url = format!("{}/setup", self.cfg.server.base_url.trim_end_matches('/'));
-        let creds = resolve_credentials(&self.cfg, &self.db)
+        // A read FAILURE (e.g. `enc:` secrets with a missing/wrong MQ_SECRET__KEY)
+        // must NOT be flattened to "not registered" — that would hide a
+        // misconfigured key behind the setup gate and invite a re-register. Surface
+        // it as an error so the dashboard shows a problem, not the connect CTA.
+        let creds = SetupService::resolve_credentials(&self.cfg, &self.db)
             .await
-            .ok()
-            .flatten();
+            .map_err(|_| {
+                ApiError::Internal(
+                    "failed to read stored App credentials (check MQ_SECRET__KEY)".into(),
+                )
+            })?;
         let owner = self.rt.app_owner().await;
-        Json(match creds {
+        Ok(Json(match creds {
             Some(c) => SetupStatus {
                 registered: true,
                 setup_url,
@@ -466,7 +197,7 @@ impl Api {
                 manage_url: None,
                 source: None,
             },
-        })
+        }))
     }
 
     /// The signed-in user (or 401). The dashboard gates on this.
@@ -475,13 +206,7 @@ impl Api {
         &self,
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<MeView>> {
-        let unauthorized = || Error::from_string("unauthorized", StatusCode::UNAUTHORIZED);
-        let token = session.0.ok_or_else(unauthorized)?;
-        let sid = Uuid::parse_str(&token).map_err(|_| unauthorized())?;
-        let user = current_user(&self.db, sid)
-            .await
-            .map_err(Self::db_err)?
-            .ok_or_else(unauthorized)?;
+        let user = self.session_user(&session).await?;
         Ok(Json(MeView {
             login: user.login,
             avatar_url: user.avatar_url,
@@ -495,7 +220,9 @@ impl Api {
         #[oai(name = "mq_session")] session: Cookie<Option<String>>,
     ) -> Result<Json<Vec<RepoView>>> {
         self.require_session(&session).await?;
-        let repos = Store::list_repos(&self.db).await.map_err(Self::db_err)?;
+        let repos = RepoStore::list_repos(&self.db)
+            .await
+            .map_err(ApiError::Db)?;
         Ok(Json(repos.into_iter().map(RepoView::from).collect()))
     }
 
@@ -512,7 +239,7 @@ impl Api {
             .rt
             .list_open_pulls(repo_id)
             .await
-            .map_err(|e| Error::from_string(e.to_string(), StatusCode::BAD_GATEWAY))?;
+            .map_err(|e| ApiError::BadGateway(e.to_string()))?;
         Ok(Json(pulls.into_iter().map(PrView::from).collect()))
     }
 
@@ -526,18 +253,18 @@ impl Api {
     ) -> Result<Json<Vec<QueueView>>> {
         let repo_id = Self::parse_repo(&repo_id.0)?;
         self.authorize_repo(&session, repo_id).await?;
-        let summaries = Store::list_queues(&self.db, repo_id)
+        let summaries = QueueStore::list_queues(&self.db, repo_id)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         let mut views = Vec::with_capacity(summaries.len());
         for s in summaries {
             let id = s.id;
             let mut view = QueueView::from(s);
-            view.active = Store::active_batch_view(&self.db, id)
+            view.active = BatchStore::active_batch_view(&self.db, id)
                 .await
-                .map_err(Self::db_err)?
+                .map_err(ApiError::Db)?
                 .as_ref()
-                .map(ActiveBatchView::of);
+                .map(ActiveBatchView::from);
             views.push(view);
         }
         Ok(Json(views))
@@ -556,36 +283,34 @@ impl Api {
         self.authorize_repo(&session, repo_id).await?;
         let name = body.0.name.trim().to_lowercase();
         if !Self::is_ref_safe(&name) {
-            return Err(Error::from_string(
-                "queue name must match ^[a-z0-9][a-z0-9-]*$",
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ));
+            return Err(
+                ApiError::Validation("queue name must match ^[a-z0-9][a-z0-9-]*$".into()).into(),
+            );
         }
-        if Store::queue_id_by_name(&self.db, repo_id, &name)
+        if QueueStore::queue_id_by_name(&self.db, repo_id, &name)
             .await
-            .map_err(Self::db_err)?
+            .map_err(ApiError::Db)?
             .is_some()
         {
-            return Err(Error::from_string(
-                format!("a queue named `{name}` already exists in this repo"),
-                StatusCode::CONFLICT,
-            ));
+            return Err(ApiError::Conflict(format!(
+                "a queue named `{name}` already exists in this repo"
+            ))
+            .into());
         }
-        let default_id = Store::queue_id_by_name(&self.db, repo_id, "default")
+        let default_id = QueueStore::queue_id_by_name(&self.db, repo_id, "default")
             .await
-            .map_err(Self::db_err)?
-            .ok_or_else(|| Error::from_string("unknown repo", StatusCode::NOT_FOUND))?;
-        let default = Store::queue_config(&self.db, default_id)
+            .map_err(ApiError::Db)?
+            .ok_or_else(|| ApiError::NotFound("unknown repo".into()))?;
+        let default = QueueStore::queue_config(&self.db, default_id)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         let default_base = default.base_branch.clone();
         let base_branch = body.0.base_branch.unwrap_or(default.base_branch);
         let batch_size = body.0.batch_size.unwrap_or(default.batch_size as i32);
         if batch_size <= 0 {
-            return Err(Error::from_string(
-                "batch size must be a positive integer",
-                StatusCode::UNPROCESSABLE_ENTITY,
-            ));
+            return Err(
+                ApiError::Validation("batch size must be a positive integer".into()).into(),
+            );
         }
         let required_checks = if base_branch == default_base {
             default.required_checks
@@ -595,7 +320,7 @@ impl Api {
                 .await
                 .unwrap_or_default()
         };
-        let queue_id = Store::create_queue(
+        let queue_id = QueueStore::create_queue(
             &self.db,
             repo_id,
             &name,
@@ -606,17 +331,15 @@ impl Api {
             &required_checks,
         )
         .await
-        .map_err(Self::db_err)?;
-        let summaries = Store::list_queues(&self.db, repo_id)
+        .map_err(ApiError::Db)?;
+        let summaries = QueueStore::list_queues(&self.db, repo_id)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         let view = summaries
             .into_iter()
             .find(|s| s.id == queue_id)
             .map(QueueView::from)
-            .ok_or_else(|| {
-                Error::from_string("queue vanished", StatusCode::INTERNAL_SERVER_ERROR)
-            })?;
+            .ok_or_else(|| ApiError::Internal("queue vanished".into()))?;
         Ok(Json(view))
     }
 
@@ -629,12 +352,12 @@ impl Api {
     ) -> Result<Json<Vec<EntryView>>> {
         let queue_id = Self::parse_queue(&queue_id.0)?;
         self.authorize_queue(&session, queue_id).await?;
-        let entries = Store::list_entries(&self.db, queue_id)
+        let entries = EntryStore::list_entries(&self.db, queue_id)
             .await
-            .map_err(Self::db_err)?;
-        let batch = Store::active_batch_view(&self.db, queue_id)
+            .map_err(ApiError::Db)?;
+        let batch = BatchStore::active_batch_view(&self.db, queue_id)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         let views = entries
             .into_iter()
             .map(|e| EntryView::project(e, batch.as_ref()))
@@ -654,9 +377,9 @@ impl Api {
         let queue_id = Self::parse_queue(&queue_id.0)?;
         self.authorize_queue(&session, queue_id).await?;
         let limit = limit.0.unwrap_or(50).min(200);
-        let rows = Store::list_ledger(&self.db, queue_id, limit)
+        let rows = LedgerStore::list_ledger(&self.db, queue_id, limit)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         Ok(Json(rows.into_iter().map(LedgerView::project).collect()))
     }
 
@@ -678,22 +401,22 @@ impl Api {
             .map_err(Self::enqueue_err)?
         {
             Enqueued::Ok { entry, .. } => {
-                let batch = Store::active_batch_view(&self.db, queue_id)
+                let batch = BatchStore::active_batch_view(&self.db, queue_id)
                     .await
-                    .map_err(Self::db_err)?;
+                    .map_err(ApiError::Db)?;
                 Ok(Json(EntryView::project(entry, batch.as_ref())))
             }
             Enqueued::WrongBase {
                 pr_base,
                 queue_base,
-            } => Err(Error::from_string(
-                format!("this PR targets {pr_base}, but the queue lands into {queue_base}"),
-                StatusCode::UNPROCESSABLE_ENTITY,
-            )),
-            Enqueued::AlreadyQueued { queue } => Err(Error::from_string(
-                format!("this PR is already open in the `{queue}` queue; remove it there first"),
-                StatusCode::CONFLICT,
-            )),
+            } => Err(ApiError::Validation(format!(
+                "this PR targets {pr_base}, but the queue lands into {queue_base}"
+            ))
+            .into()),
+            Enqueued::AlreadyQueued { queue } => Err(ApiError::Conflict(format!(
+                "this PR is already open in the `{queue}` queue; remove it there first"
+            ))
+            .into()),
         }
     }
 
@@ -710,23 +433,23 @@ impl Api {
         let queue_id = Self::parse_queue(&queue_id.0)?;
         self.authorize_queue(&session, queue_id).await?;
         let entry_id = Self::parse_queue(&entry_id.0)?;
-        if let Some(entry) = Store::entry(&self.db, entry_id)
+        if let Some(entry) = EntryStore::entry(&self.db, entry_id)
             .await
-            .map_err(Self::db_err)?
+            .map_err(ApiError::Db)?
             && entry.queue_id != queue_id
         {
-            return Err(Error::from_string("unknown entry", StatusCode::NOT_FOUND));
+            return Err(ApiError::NotFound("unknown entry".into()).into());
         }
-        match self.rt.force_dequeue(entry_id).await.map_err(|_| {
-            Error::from_string(
-                "could not remove this PR",
-                StatusCode::INTERNAL_SERVER_ERROR,
+        match self
+            .rt
+            .force_dequeue(entry_id)
+            .await
+            .map_err(|_| ApiError::Internal("could not remove this PR".into()))?
+        {
+            Removed::Busy { .. } => Err(ApiError::Conflict(
+                "can't remove — the batch is merging; try again in a moment".into(),
             )
-        })? {
-            Removed::Busy { .. } => Err(Error::from_string(
-                "can't remove — the batch is merging; try again in a moment",
-                StatusCode::CONFLICT,
-            )),
+            .into()),
             Removed::Gone { .. } | Removed::NotQueued => Ok(Json(Health {
                 status: "ok".into(),
             })),
@@ -748,20 +471,20 @@ impl Api {
         for raw in &body.0.entry_ids {
             ids.push(
                 Uuid::parse_str(raw)
-                    .map_err(|_| Error::from_string("invalid entry id", StatusCode::BAD_REQUEST))?,
+                    .map_err(|_| ApiError::BadRequest("invalid entry id".into()))?,
             );
         }
-        let txn = self.db.begin().await.map_err(Self::db_err)?;
-        Store::reorder(&txn, queue_id, &ids)
+        let txn = self.db.begin().await.map_err(ApiError::Db)?;
+        EntryStore::reorder(&txn, queue_id, &ids)
             .await
-            .map_err(Self::db_err)?;
-        txn.commit().await.map_err(Self::db_err)?;
-        let entries = Store::list_entries(&self.db, queue_id)
+            .map_err(ApiError::Db)?;
+        txn.commit().await.map_err(ApiError::Db)?;
+        let entries = EntryStore::list_entries(&self.db, queue_id)
             .await
-            .map_err(Self::db_err)?;
-        let batch = Store::active_batch_view(&self.db, queue_id)
+            .map_err(ApiError::Db)?;
+        let batch = BatchStore::active_batch_view(&self.db, queue_id)
             .await
-            .map_err(Self::db_err)?;
+            .map_err(ApiError::Db)?;
         let views = entries
             .into_iter()
             .map(|e| EntryView::project(e, batch.as_ref()))
@@ -799,7 +522,7 @@ mod tests {
     };
     use crate::queue::LedgerOutcome;
     use crate::runtime::Runtime;
-    use crate::store::{Store, queue_ledger};
+    use crate::store::{InstallationStore, QueueStore, RepoStore, queue_ledger};
 
     /// A minimal `RepoClient` for API authz tests: it answers `user_permission` with a
     /// fixed level and `required_checks` with a fixed set; everything else is inert.
@@ -940,6 +663,7 @@ mod tests {
             database: DatabaseConfig {
                 url: SecretString::from("postgres://test"),
             },
+            secret: None,
         };
         let rt = Arc::new(Runtime::new(cfg.clone(), db.clone()));
         Api { cfg, db, rt }
@@ -954,13 +678,17 @@ mod tests {
     }
 
     async fn seed_repo(db: &DatabaseConnection) -> (Uuid, Uuid) {
-        Store::provision_installation(db, 88, "acme").await.unwrap();
-        Store::upsert_repo(db, 88, "acme", "widgets").await.unwrap();
-        let repo_id = Store::repo_id_by_name(db, "acme", "widgets")
+        InstallationStore::provision_installation(db, 88, "acme")
+            .await
+            .unwrap();
+        RepoStore::upsert_repo(db, 88, "acme", "widgets")
+            .await
+            .unwrap();
+        let repo_id = RepoStore::repo_id_by_name(db, "acme", "widgets")
             .await
             .unwrap()
             .unwrap();
-        let queue_id = Store::queue_id_by_name(db, repo_id, "default")
+        let queue_id = QueueStore::queue_id_by_name(db, repo_id, "default")
             .await
             .unwrap()
             .unwrap();
@@ -1151,7 +879,7 @@ mod tests {
         .await;
         let (repo_id, default_id) = seed_repo(&db).await;
         let sid = seed_session(&db).await;
-        Store::set_queue_required_checks(&db, default_id, &["ci".to_string()])
+        QueueStore::set_queue_required_checks(&db, default_id, &["ci".to_string()])
             .await
             .unwrap();
 
@@ -1168,7 +896,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let same_cfg = Store::queue_config(&db, Uuid::parse_str(&same.id).unwrap())
+        let same_cfg = QueueStore::queue_config(&db, Uuid::parse_str(&same.id).unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1190,7 +918,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let diff_cfg = Store::queue_config(&db, Uuid::parse_str(&diff.id).unwrap())
+        let diff_cfg = QueueStore::queue_config(&db, Uuid::parse_str(&diff.id).unwrap())
             .await
             .unwrap();
         assert_eq!(
