@@ -1,36 +1,34 @@
 "use client";
 
-/* Landing-nav auth slot: shows "Log in with GitHub" only when signed out, and the
-   signed-in handle otherwise — so a logged-in visitor never sees a login button. */
+/* Landing-nav auth slot (live dashboard only — gated behind !STATIC_SITE at the
+   call site, so it never mounts in the GitHub Pages export). Three states, in
+   order: the signed-in handle; a "Set up" CTA when signed out *and the GitHub App
+   isn't registered yet* (OAuth login is impossible without it, so we point at the
+   manifest flow instead); and the plain "Log in with GitHub" once the App exists. */
 
-import { useEffect, useState } from "react";
-
-import { getMe } from "@/lib/api";
-import type { MeView } from "@/lib/api";
+import { useLandingAuth } from "@/lib/use-landing-auth";
 
 export function NavAuth() {
-  const [me, setMe] = useState<MeView | null>(null);
-  const [loaded, setLoaded] = useState(false);
-
-  useEffect(() => {
-    let alive = true;
-    getMe()
-      .then((u) => {
-        if (!alive) return;
-        setMe(u);
-        setLoaded(true);
-      })
-      .catch(() => alive && setLoaded(true));
-    return () => {
-      alive = false;
-    };
-  }, []);
+  const { loaded, me, setup, registered, setupError } = useLandingAuth();
 
   if (!loaded) return null;
   if (me) {
     return (
       <a className="lp-user" href="/app" title="open the dashboard">
         @{me.login}
+      </a>
+    );
+  }
+  // Signed out and either the App isn't registered yet, or its stored secrets are
+  // broken (a setup/key error the backend reports) — login would dead-end, so point
+  // the operator at the setup flow rather than an unusable "Log in".
+  if (setupError || (setup && !registered)) {
+    return (
+      <a className="lp-setup" href={setup?.setupUrl ?? "/setup"}>
+        <span className="lp-setup-spark" aria-hidden>
+          ✦
+        </span>
+        {setupError ? "Fix setup" : "Set up mergequeue"}
       </a>
     );
   }

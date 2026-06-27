@@ -86,6 +86,56 @@
   border-color: var(--accent);
 }
 
+/* First-run CTA: the App isn't registered yet, so this is the one thing to click.
+   An outlined pill that breathes its accent border on an interval to draw the eye
+   without the heaviness of a filled button. */
+.lp-setup {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-4);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--r-pill);
+  font-family: var(--font-board);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-tight);
+  color: var(--accent) !important;
+  background: transparent;
+  animation: lp-setup-breathe 2.6s var(--ease) infinite;
+  transition: background var(--dur-2) var(--ease), border-color var(--dur-2) var(--ease);
+}
+.lp-setup:hover {
+  animation: none;
+  background: var(--accent-subtle);
+  border-color: var(--accent);
+  box-shadow: var(--accent-glow);
+}
+.lp-setup-spark {
+  display: inline-block;
+  font-size: 0.85em;
+  animation: lp-setup-twinkle 2.6s var(--ease) infinite;
+}
+@keyframes lp-setup-breathe {
+  0%, 100% {
+    border-color: var(--accent-border);
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    border-color: var(--accent);
+    box-shadow: var(--accent-glow);
+  }
+}
+@keyframes lp-setup-twinkle {
+  0%, 100% {
+    opacity: 0.55;
+    transform: scale(0.85) rotate(0deg);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1) rotate(90deg);
+  }
+}
+
 /* ---- buttons ---- */
 .btn {
   display: inline-flex;
@@ -801,5 +851,12 @@
   .board-car.is-out,
   .lp-lamp.is-out {
     transform: none;
+  }
+  .lp-setup,
+  .lp-setup-spark {
+    animation: none;
+  }
+  .lp-setup {
+    border-color: var(--accent);
   }
 }

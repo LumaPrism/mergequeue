@@ -2,6 +2,8 @@ import type { Metadata } from "next";
 import type { CSSProperties } from "react";
 import Link from "next/link";
 
+import { DashboardCta } from "@/components/DashboardCta";
+import { DashboardLink } from "@/components/DashboardLink";
 import { DepartureBoard } from "@/components/DepartureBoard";
 import { InstallLine } from "@/components/InstallLine";
 import { NavAuth } from "@/components/NavAuth";
@@ -119,7 +121,7 @@ export default function Landing() {
         </Link>
         <div className="lp-nav-links">
           <a href={`${ASSET_BASE}/docs`}>Docs</a>
-          {!STATIC_SITE && <Link href="/app">Dashboard</Link>}
+          {!STATIC_SITE && <DashboardLink />}
           <a
             className="lp-icon-link"
             href={GITHUB_URL}
@@ -163,10 +165,7 @@ export default function Landing() {
                   <span className="btn-arrow">→</span>
                 </a>
               ) : (
-                <Link href="/app" className="btn btn-ghost">
-                  Open the dashboard
-                  <span className="btn-arrow">→</span>
-                </Link>
+                <DashboardCta />
               )}
             </div>
           </div>
@@ -318,7 +317,7 @@ export default function Landing() {
         <span className="lp-foot-tag">ci-agnostic, self-hosted merge queue</span>
         <span className="lp-foot-links">
           <a href={`${ASSET_BASE}/docs`}>Docs</a>
-          {!STATIC_SITE && <Link href="/app">Dashboard</Link>}
+          {!STATIC_SITE && <DashboardLink />}
           <a
             className="lp-icon-link"
             href={GITHUB_URL}
